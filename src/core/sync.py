@@ -41,8 +41,8 @@ SOFT_DRIFT_MS = 50.0
 SYNC_CHECK_INTERVAL = 1.0
 # Number of consecutive drift readings before acting
 DRIFT_CONFIRM_COUNT = 3
-# Frame-gen 过渡期：vf 链重建后 video_pos 推进恢复平稳所需的缓冲时间（秒）
-FRAME_GEN_SETTLE_S = 4.0
+# Frame-gen 过渡期（已无调用方；保留常量与 settle 窗口机制供未来扰动场景使用）
+SETTLE_S = 4.0
 
 
 class SyncManager:
@@ -81,10 +81,10 @@ class SyncManager:
         self._enhanced_duration_s = 0.0
         self._drift_history: list[float] = []  # recent drift readings for confirmation
 
-        # 帧生成 (RIFE 真插帧) 状态：vf 链重建过渡期内抑制漂移确认
-        self._frame_gen_active = False
-        self._frame_gen_multiplier = 1.0
-        self._frame_gen_settle_until = 0.0  # monotonic 时间戳
+        # 时序扰动过渡期：切换/seek 等扰动后 video_pos 推进不稳，需短暂抑制漂移确认。
+        # （原用于 RIFE 真插帧 vf 重建过渡期，后端已移除；过渡窗口机制保留给
+        #   activate_enhanced 等既有扰动场景。）
+        self._settle_until = 0.0  # monotonic 时间戳
 
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -168,24 +168,6 @@ class SyncManager:
         """Called when user changes playback speed."""
         self._base_speed = speed
 
-    def set_frame_gen_active(self, active: bool, multiplier: float = 1.0):
-        """通知同步管理器 RIFE 真插帧的启停（display-resample 不调用本方法）。
-
-        active=True 时 vf 链刚重建，video_pos 在过渡期内推进不稳，需短暂抑制漂移
-        确认并清空历史，避免把 vf 重建抖动误读为 A/V 漂移。稳态判据不变（插帧不改变
-        PTS 时长，稳态漂移仍应为 0）。multiplier 仅用于状态记录/日志。
-        """
-        with self._lock:
-            self._frame_gen_active = active
-            self._frame_gen_multiplier = multiplier if active else 1.0
-            # 进入/退出插帧都视作一次时序扰动：清空历史并开启过渡抑制窗口
-            self._drift_history.clear()
-            self._frame_gen_settle_until = time.monotonic() + FRAME_GEN_SETTLE_S
-            if self._correction_active:
-                self._correction_active = False
-                self._restore_speed()
-        logger.info("Frame-gen sync adapt: active=%s, multiplier=%.2fx", active, multiplier)
-
     def fallback_to_original(self, reason: str = ""):
         """Emergency fallback to original audio."""
         logger.warning(f"Falling back to original audio: {reason}")
@@ -245,7 +227,7 @@ class SyncManager:
                     continue
                 if now - self._last_resume_time < self._resume_cooldown:
                     continue
-                if now < self._frame_gen_settle_until:  # 插帧 vf 重建过渡期
+                if now < self._settle_until:  # 时序扰动过渡期
                     continue
 
             try:

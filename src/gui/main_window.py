@@ -922,14 +922,12 @@ class MainWindow(QMainWindow):
             self._stop_ls_if_selected()
             self._framegen_state = {"backend": "off", "multiplier": 1.0,
                                     "target_fps": 0, "applied": False}
-            self._sync.set_frame_gen_active(False, 1.0)
             self._update_media_info()
             return
 
         if backend == "display-resample":
             self._stop_ls_if_selected()
             self._apply_display_resample(player, params)
-            self._sync.set_frame_gen_active(False, 1.0)
         elif backend == "lossless-scaling":
             self._enable_lossless_scaling(params)
         self._update_media_info()
@@ -971,7 +969,6 @@ class MainWindow(QMainWindow):
             # 回退到关闭状态（面板会因 caps 不可用回落到 display-resample）
             self._framegen_state = {"backend": "off", "multiplier": 1.0,
                                     "target_fps": 0, "applied": False}
-            self._sync.set_frame_gen_active(False, 1.0)
             return
         # 复位 mpv 伪插帧 property（小黄鸭不是 mpv interpolation）
         if player:
@@ -987,7 +984,6 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(800, self._tame_ls_window)
         self._framegen_state = {"backend": "lossless-scaling", "multiplier": 1.0,
                                 "target_fps": 0, "applied": True}
-        self._sync.set_frame_gen_active(False, 1.0)
         # 若已处于全屏，立即开启缩放
         if getattr(self, "_is_fullscreen", False):
             self._ls_controller.start_scaling()

@@ -8,20 +8,12 @@ logger = logging.getLogger(__name__)
 
 
 def _install_robust_logging():
-    """给宿主日志套上对“坏 handler”的免疫层，并装一个基础的根 handler。
+    """给宿主日志装一个基础的根 handler，并套上对“坏 handler”的免疫层。
 
-    根因（已实证）：mpv 内嵌的 VapourSynth VSScript 会往**根 logger** 挂一个有 bug
-    的 handler —— PythonVSScriptLoggingBridge.emit 访问不存在的属性 `parent`
-    （应为 `_parent`）。一旦挂上，宿主进程里任何 logger.*() 只要冒泡到根 logger，
-    就会抛 AttributeError 并使整条调用链崩溃。这正是开启 SVP 后“vf 注入成功 → 紧接着
-    set_frame_gen_active 里的 logger.info 崩溃 → 被 except 当成失败而回退
-    display-resample”的真因；而且播放期间 sync 漂移监控线程的周期日志也会反复触发同
-    一崩溃。
-
-    宿主严禁 import vapoursynth（否则原生崩溃 0xe24c4a02），无法直接修那个类。故在
-    logging.Logger.callHandlers 外面套 try/except：任何 handler 抛错都被吞掉，绝不反噬
-    调用方。这是覆盖全进程的单点修复，取代之前逐文件 logger→print 的打地鼠式改法。
-    先注册我们自己的根 handler，保证它在 VS 桥之前执行、日志照常输出。
+    历史背景：早期内置 SVP/RIFE 后端时，mpv 内嵌的 VapourSynth VSScript 会往根
+    logger 挂一个有 bug 的 handler，任何 logging 调用都会被反噬崩溃。真插帧后端
+    已移除，但这层免疫保留 —— 任何第三方（mpv 事件循环、模型库）往根 logger 挂的
+    坏 handler 都不应让宿主 logging 调用崩溃。
     """
     logging.raiseExceptions = False  # 静默 handler 内部错误，不再往 stderr 喷栈
 
@@ -77,53 +69,6 @@ _setup_exception_hooks()
 _project_root = str(Path(__file__).resolve().parent.parent)
 os.environ["PATH"] = _project_root + os.pathsep + os.environ.get("PATH", "")
 
-
-def _expose_vapoursynth_to_mpv():
-    """让 mpv 内嵌的 VSScript 能找到 vapoursynth 的 DLL，用于帧生成 (vf=vapoursynth=)。
-
-    关键约束（已实证）：宿主进程**绝不能** `import vapoursynth`。一旦宿主先 import
-    了 vapoursynth，再让 mpv 内嵌的 VSScript 初始化它自己的 VapourSynth，会因 Python
-    子解释器/单例冲突触发原生崩溃 (Windows fatal exception 0xe24c4a02)。
-    因此这里只用 importlib.util.find_spec 定位 wheel 目录（不 import），通过
-    os.add_dll_directory + PATH 暴露 DLL，让 mpv 自己加载。
-
-    另外 VSScript 首次使用前需要一份配置 toml（记录 Python 解释器路径），否则报
-    "Python executable and library path couldn't be determined"。这里在缺失时用
-    子进程跑 `python -m vapoursynth config` 生成（子进程 import 不影响宿主）。
-    """
-    import importlib.util
-    try:
-        spec = importlib.util.find_spec("vapoursynth")
-    except Exception as e:
-        logger.info("帧生成: 未检测到 vapoursynth (%s)，跳过 VS DLL 暴露", e)
-        return
-    if spec is None or not spec.origin:
-        logger.info("帧生成: 未安装 vapoursynth，帧生成 RIFE 后端不可用")
-        return
-
-    vs_dir = os.path.dirname(spec.origin)
-    os.environ["PATH"] = vs_dir + os.pathsep + os.environ.get("PATH", "")
-    try:
-        os.add_dll_directory(vs_dir)
-    except (OSError, AttributeError) as e:
-        logger.warning("帧生成: add_dll_directory(%s) 失败: %s", vs_dir, e)
-
-    # 确保 VSScript 配置 toml 存在（缺失则用子进程生成，不在宿主 import vapoursynth）
-    try:
-        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        toml_path = Path(appdata) / "vapoursynth" / "vapoursynth.toml"
-        if not toml_path.exists():
-            import subprocess
-            subprocess.run(
-                [sys.executable, "-m", "vapoursynth", "config"],
-                capture_output=True, timeout=30,
-            )
-            logger.info("帧生成: 已生成 VapourSynth 配置 %s", toml_path)
-    except Exception as e:
-        logger.warning("帧生成: 生成 VapourSynth 配置失败: %s", e)
-
-
-_expose_vapoursynth_to_mpv()
 
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 

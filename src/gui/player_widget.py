@@ -61,10 +61,8 @@ class MpvPlayerWidget(QWidget):
         self._poll_timer.start()
 
     def _mpv_log(self, loglevel, component, message):
-        # 防御性：VapourSynth 的 VSScript 会往 root logger 挂一个有 bug 的日志桥
-        # (PythonVSScriptLoggingBridge, 缺 .parent)，启用 RIFE 后任何 logging 调用
-        # 经它转发都会抛异常并污染 mpv 事件循环。这里吞掉下游 handler 的异常，
-        # 保证日志失败绝不反噬 mpv 事件循环。
+        # 吞掉下游 handler 的异常，保证日志失败绝不反噬 mpv 事件循环。
+        # （历史：曾防御 VapourSynth 日志桥崩溃；真插帧后端已移除，免疫层保留。）
         try:
             if loglevel in ("error", "fatal"):
                 logger.error(f"[mpv/{component}] {message}")
@@ -213,14 +211,11 @@ class MpvPlayerWidget(QWidget):
             self._player.speed = speed
 
     def set_hwdec_for_vf(self, need_copy: bool):
-        """切换 hwdec 以适配 CPU 侧 vf 滤镜（如 vapoursynth RIFE）。
+        """切换 hwdec 以适配 CPU 侧 vf 滤镜（如视频增强面板的 CPU 降噪滤镜）。
 
-        VapourSynth 这类 vf 滤镜需要 CPU 可读帧；auto-safe 会把帧留在 GPU surface 上，
+        CPU 侧 vf 滤镜需要 CPU 可读帧；auto-safe 会把帧留在 GPU surface 上，
         滤镜拿不到帧。need_copy=True 切到 auto-copy（解码仍走硬件，但 copy-back 回系统内存），
         need_copy=False 恢复 auto-safe（零拷贝、低功耗）。
-
-        注意：SVP 的 GPU 渲染（OpenCL）不需要 CPU 可读帧，所以 SVP 后端不调用本方法。
-        仅 RIFE 后端需要调用。
         """
         if not self._player:
             return
@@ -240,7 +235,7 @@ class MpvPlayerWidget(QWidget):
             print(f"[hwdec] 切换失败: {e}")
 
     def clear_video_filters(self):
-        """清空 vf 滤镜链。终止 mpv 前必须先清，避免 vapoursynth+torch 在析构时原生崩溃。"""
+        """清空 vf 滤镜链。终止 mpv 前先清，避免残留滤镜在析构时引发问题。"""
         if self._player:
             try:
                 self._player.command("vf", "set", "")
@@ -376,7 +371,7 @@ class MpvPlayerWidget(QWidget):
     def destroy(self):
         self._poll_timer.stop()
         if self._player:
-            # 先清 vf：vapoursynth+torch 滤镜若残留，terminate 时会原生崩溃 (0xe24c4a02)
+            # 先清 vf：残留滤镜可能在 terminate 时引发原生层问题
             self.clear_video_filters()
             self._player.terminate()
             self._player = None
