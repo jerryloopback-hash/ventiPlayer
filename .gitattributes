@@ -1,2 +1,11 @@
-# Auto detect text files and perform LF normalization
 * text=auto
+
+# 明确 LF，避免 Windows 上 CRLF 反复转换
+*.py text eol=lf
+*.md text eol=lf
+*.glsl text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.bat text eol=crlf
+*.ico binary
