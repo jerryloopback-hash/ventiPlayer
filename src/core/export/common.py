@@ -10,8 +10,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 # 项目根目录（libmpv-2.dll 所在）

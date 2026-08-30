@@ -1,3 +1,5 @@
+"""视频增强面板：基础画面 / CAS / 去色带 / 降噪 / HDR / 超分(Anime4K,FSR,FSRCNNX) / 帧生成；
+get_export_state() 打包可复现画面状态给视频导出。"""
 from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,

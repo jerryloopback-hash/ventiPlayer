@@ -1,3 +1,4 @@
+"""播放列表 / 播放模式 / 历史记录管理（含 ~/.ventiplayer/history.json 持久化）。"""
 import json
 import random
 from dataclasses import dataclass, asdict

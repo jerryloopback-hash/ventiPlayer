@@ -1,3 +1,5 @@
+"""主窗口组装层：继承 src/gui/mw/ 下 7 个职责 mixin，本模块只保留
+__init__ 聚合、生命周期（closeEvent）、剪贴板 URL 自动识别与字幕加载。"""
 import re
 import logging
 

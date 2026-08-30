@@ -1,3 +1,4 @@
+"""应用配置持久化：DEFAULT_CONFIG + 防抖写入 ~/.ventiplayer/config.json。"""
 import json
 import threading
 from pathlib import Path

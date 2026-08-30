@@ -1,3 +1,4 @@
+"""播放列表 / 历史面板：双击播放、拖拽重排、缩略图模式、推荐/合集提示。"""
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QMenu, QApplication, QLabel, QFrame, QTabWidget,

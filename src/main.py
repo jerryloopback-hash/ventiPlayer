@@ -1,3 +1,5 @@
+"""应用入口：日志免疫层、异常钩子、运行环境变量（MIOpen/ROCm/HF 镜像）、
+splash + MainWindow 装配。"""
 import sys
 import os
 import logging
@@ -105,7 +107,7 @@ warnings.filterwarnings("ignore", message="Importing from.*is deprecated.*timm.l
                         category=FutureWarning)
 
 from PySide6.QtWidgets import QApplication, QSplashScreen
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap, QFont, QColor, QPainter
 
 from src.gui.main_window import MainWindow

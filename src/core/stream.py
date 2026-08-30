@@ -1,3 +1,4 @@
+"""流解析：yt-dlp 取流、Cookie 状态检查、直播流处理，产出 StreamInfo。"""
 import threading
 import tempfile
 import os

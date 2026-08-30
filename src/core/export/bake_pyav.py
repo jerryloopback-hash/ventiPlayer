@@ -8,6 +8,7 @@ HDR tone-mapping（mpv GPU 管线特性，PyAV 无对应实现）。
 from __future__ import annotations
 
 import logging
+from fractions import Fraction
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -27,8 +28,6 @@ class VideoEncoderMixin:
 
         编码 H.264(libx264)，像素格式 yuv420p（兼容性最佳，宽高需为偶数）。"""
         import av
-        from fractions import Fraction
-
         fps = fps if fps and fps > 0 else 25.0
         rate = Fraction(fps).limit_denominator(100000)
         # H.264 yuv420p 要求宽高为偶数
@@ -77,7 +76,6 @@ class VideoEncoderMixin:
         HDR tone-mapping —— 这些是 mpv GPU 管线特性，PyAV 无对应实现，故仅缩放近似。
         """
         import av
-        from fractions import Fraction
 
         options = {}
         if http_headers:

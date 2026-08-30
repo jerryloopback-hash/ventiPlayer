@@ -1,3 +1,4 @@
+"""音频增强面板：Apollo/FlashSR 独立勾选 + fp16 子选项 + 修复按钮 + 进度条 + 开源方案介绍。"""
 from PySide6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
     QCheckBox, QLabel,

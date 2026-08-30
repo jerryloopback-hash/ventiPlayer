@@ -1,3 +1,4 @@
+"""mpv 嵌入播放组件：wid 嵌入、QTimer 轮询位置/状态、音频设备/独占切换、字幕挂载。"""
 import sys
 import locale
 import logging
