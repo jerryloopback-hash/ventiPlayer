@@ -52,7 +52,7 @@
 
 ## 目前已经实现的工作
 
-按 `PLAN.md` / `DEBUG_PLAN.md` 中的 Phase 划分：
+按开发 Phase 划分（原始 plan 文档已归档到 `docs/dev-notes/`，过时文档已删除）：
 
 | Phase | 内容 | 状态 |
 |---|---|---|
@@ -335,14 +335,21 @@ QApplication 入口。负责：
 - 顶层异常拦截，避免静默崩溃
 
 ### `src/gui/main_window.py`
-主窗口。聚合 `MpvPlayerWidget` + `EnhancePanel` + `VideoEnhancePanel` + `ContentBrowser` + `PlaylistPanel`，负责：
-- URL 解析触发、Stream 信息回填到 UI；剪贴板自动识别支持的链接并填入 URL 栏（不自动播放）
-- 把 `Enhancer` / `AudioPipeline` / `SyncManager` 串起来
-- `PipelineState` 状态机回调到 GUI（进度、错误提示、自动 fallback 提示）
-- 驱动字幕生成（`SubtitlePipeline`）并把生成的 SRT 挂载到播放器
-- 驱动**视频导出**（`VideoExporter`）：从设置面板信号触发，拼装 `ExportSettings`、起后台导出、进度对话框与「导出成功」结果弹窗
-- 启动资源监视器，按推理后端在状态栏刷新 CPU/RAM/GPU/显存
-- 快捷键：`Space` 暂停 / `Ctrl+Enter` 解析播放 / `F` 全屏 / `Esc` 退出全屏 / `←→` ±5 s seek / `N`/`P` 上下一个
+主窗口组装层。`MainWindow` 继承 `src/gui/mw/` 下的 7 个职责 mixin，本文件只保留：
+- `__init__`（聚合 `MpvPlayerWidget` + `EnhancePanel` + `VideoEnhancePanel` + `ContentBrowser` + `PlaylistPanel`，串起 `Enhancer` / `AudioPipeline` / `SyncManager`）
+- 生命周期（`closeEvent` 资源回收）与窗口焦点时的剪贴板 URL 自动识别（填入不播放）
+- 字幕加载（`_load_subtitle`）
+
+`src/gui/mw/` mixin 拆分：
+| mixin | 职责 |
+|---|---|
+| `ui_setup.py` | UI 构建 / 快捷键 / 信号接线 |
+| `app_init.py` | mpv 初始化、设备与 Cookie 刷新、SyncManager 配线、设置对话框入口 |
+| `playback.py` | URL 解析与流接入、transport 控制、全屏、直播重连、播放列表/B站/浏览接线、帧生成（伪插帧/小黄鸭） |
+| `media_info.py` | 状态栏媒体信息标签与 ● 指示器（音源/超分/帧生成/独占）、格式化工具 |
+| `enhance.py` | 音频增强面板与视频增强面板集成、资源监视器 |
+| `export_mixin.py` | 视频导出接线（选路径 → 后台烘焙 → 进度/结果弹窗） |
+| `subtitle_mixin.py` | Whisper + LLM 字幕生成请求与状态处理 |
 
 ### `src/gui/player_widget.py`
 mpv 嵌入组件。
@@ -356,13 +363,14 @@ mpv 嵌入组件。
 ### `src/gui/video_enhance_panel.py`
 视频增强面板（双栏）。基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射、超分辨率（Anime4K / FSR / FSRCNNX）、视频帧生成（display-resample 伪插帧 / 小黄鸭外部全屏补帧）。FSR / CAS 用运行时模板生成 `*_active.glsl`。`get_cas_sharpness()` 返回滑块值 /10（0.0–1.0），写入 shader 前再取 `1 - x` 反转（shader 中 0 = 最强锐化）。`get_export_state()` 把当前画面增强的完整可复现状态（着色器路径列表 / mpv render 属性 / 降噪 vf / 超分倍率 / 中文方案标签）打包给视频导出模块，复用与 live-apply 同一套纯构建函数（`_build_*`），不触发任何信号。
 
-### `src/core/video_export.py`
+### `src/core/video_export.py`（实现拆分在 `src/core/export/` 包）
 **视频导出引擎**（后台线程，进度/完成走回调）。`VideoExporter.export()` 把视频连同音频/画面增强真实烘焙为 mp4：
-- 音频：复用 `Enhancer.enhance_full` 离线重跑 Apollo/FlashSR（或直通原音），写临时 WAV
-- 画面（主路径 `_bake_video_gpu`）：Qt 离屏 OpenGL 上下文 + libmpv `MpvRenderContext`，逐帧 `frame-step` → `render()` 进 FBO → `toImage()` 回读 → PyAV 编码 H.264；着色器/render 属性/降噪 vf 与 main_window 的 live-apply 对齐（**仅允许 lavfi 降噪 vf，绝不注入 vapoursynth**）
-- 画面（退化 `_bake_video_pyav`）：GPU 上下文不可用时退化为 PyAV 解码 → numpy eq + nlmeans + lanczos 缩放近似，`gpu_baked=False` 并明确告知
-- 混流：video-only mp4 的 H.264 流原样 remux + AAC 编码音频 → 最终 mp4
-- `ExportSettings.from_states()` 一行合并面板/画面/Stream 状态；`ExportResult` 提供 `video_info_label` 等给成功弹窗
+- `export/common.py`：`ExportSettings` / `ExportResult` 数据类、格式化与截止频率估算工具
+- `export/audio.py`：音频子管线——PyAV 解码整轨 → 离线重跑 Apollo/FlashSR（或直通）→ 16-bit WAV
+- `export/bake_gpu.py`：画面主路径——Qt 离屏 OpenGL 上下文 + libmpv `MpvRenderContext`，逐帧 `frame-step` → `render()` 进 FBO → `toImage()` 回读 → PyAV 编码 H.264；着色器/render 属性/降噪 vf 与 main_window 的 live-apply 对齐（**仅允许 lavfi 降噪 vf，绝不注入 vapoursynth**）
+- `export/bake_pyav.py`：GPU 上下文不可用时的退化路径——PyAV 解码 → numpy eq + nlmeans + lanczos 缩放近似，`gpu_baked=False` 并明确告知；另含 GPU/PyAV 共享的编码器工具
+- `export/mux.py`：混流——video-only mp4 的 H.264 流原样 remux + AAC 编码音频 → 最终 mp4
+- 对外入口 `core/video_export.py` 保留 `VideoExporter` / `ExportSettings` / `ExportResult` 及全部方法名，import 路径与拆分前一致
 
 ### `src/gui/settings_dialog.py`
 设置对话框（Cookie / 显示 / LLM / 字幕 ASR / 帧生成小黄鸭 / **视频导出**）。「视频导出」分组的按钮点击发 `export_video_requested` 信号，门控、文件对话框与导出逻辑由 main_window 接管。
@@ -597,14 +605,24 @@ VentiPlayer/
 ├── start.bat             # Windows 启动脚本
 ├── download_models.py    # 一次性下载所有模型
 ├── requirements.txt
-├── PLAN.md               # 设计计划（已与实现对齐）
-├── DEBUG_PLAN.md         # 调试历程（已清理完毕，归档）
+├── logo.ico              # 应用图标
 ├── README.md             # 当前文件
 ├── LICENSE               # MIT
+├── docs/
+│   ├── 项目梳理报告-20260830.md
+│   └── dev-notes/        # 归档的开发期过程文档
+├── tests/                # 单元测试（unittest，可直接运行）
 ├── src/
 │   ├── main.py
-│   ├── gui/{main_window,player_widget,enhance_panel,video_enhance_panel,content_browser,playlist_panel,settings_dialog,thumbnail_cache}.py
-│   ├── core/{stream,audio_pipe,enhancer,sync,playlist,bilibili_api,subtitle,asr_engine,llm,resource_monitor,frame_gen,lossless_scaling,video_export}.py
+│   ├── gui/
+│   │   ├── main_window.py        # 主窗口组装（生命周期/剪贴板/设置持久化）
+│   │   ├── mw/                   # 主窗口 mixin：ui_setup / app_init / playback /
+│   │   │                         #   media_info / enhance / export_mixin / subtitle_mixin
+│   │   └── {player_widget,enhance_panel,video_enhance_panel,content_browser,playlist_panel,settings_dialog,thumbnail_cache}.py
+│   ├── core/
+│   │   ├── {stream,audio_pipe,enhancer,sync,playlist,bilibili_api,subtitle,asr_engine,llm,resource_monitor,frame_gen,lossless_scaling}.py
+│   │   └── export/               # 视频导出包：common / audio / bake_gpu / bake_pyav / mux
+│   │                             #   （对外入口仍是 core/video_export.py）
 │   ├── models/{apollo_model,flashsr_model}.py + {apollo_src,flashsr_src}/  # vendored 模型源码
 │   └── config/settings.py
 │
@@ -619,7 +637,7 @@ VentiPlayer/
 ├── .venv312/             ≈ 13 GB
 ├── libmpv-2.dll          ≈ 114 MB
 ├── deno.exe              ≈ 123 MB
-└── cookies/              用户登录态
+└── cookies/              用户登录态（建议只放 B 站最小 cookie）
 ```
 
 ### `.gitignore` 取舍逻辑
@@ -675,6 +693,7 @@ MIT — see [LICENSE](LICENSE).
 - Apollo (JusperLee/Look2Hear, Tsinghua)：模型源码 CC-BY-SA 4.0（vendored 在 `src/models/apollo_src/`），权重原作者保留版权
 - FlashSR (Im & Nam, KAIST)：推理源码 Apache 2.0（laion 再分发，vendored 在 `src/models/flashsr_src/`），权重承袭 AudioSR / MIT
 - PySide6：LGPLv3 / GPLv2 / 商业三可选
+- GLSL 着色器（`shaders/`）：Anime4K (bloc97) MIT、CAS (AMD) MIT、FSR (AMD) MIT、FSRCNNX (igv) LGPLv2.1+，均保留原文件内许可声明
 
 > 注意 Apollo 为 CC-BY-SA 4.0（copyleft + 署名 + 相同方式共享），个人播放器内使用没问题，若你打算再分发其权重或衍生需遵守 share-alike 条款。
 
