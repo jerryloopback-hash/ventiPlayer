@@ -1,7 +1,7 @@
 """音频增强重构单元测试：enhancer 组合链 + audio_pipe 立体声 + 可用性探测。
 
 mock 掉 Apollo/FlashSR 模型，无需真实权重或 GPU。
-运行：.venv312/Scripts/python.exe test_audio_enhance.py
+运行：.venv312/Scripts/python.exe tests/test_audio_enhance.py
 """
 
 import sys
@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from src.core.enhancer import Enhancer, Backend, DeviceInfo
 

@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 # 让 import src.core.lossless_scaling 可用
-sys.path.insert(0, ".")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from src.core.lossless_scaling import LosslessScalingController
 
