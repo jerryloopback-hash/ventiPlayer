@@ -1,0 +1,113 @@
+# ==========================================================================
+# Python
+# ==========================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# ==========================================================================
+# Virtual environments — must NOT be committed (this one is ~13 GB)
+# ==========================================================================
+.venv*/
+venv/
+env/
+ENV/
+
+# MIOpen GPU kernel cache (machine-specific, regenerated at runtime)
+.miopen_cache/
+
+# ==========================================================================
+# Environments / IDE
+# ==========================================================================
+.env
+.env.local
+.idea/
+*.iml
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Keep .vscode/settings.json so the interpreter path is shared,
+# but ignore everything else under .vscode.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# ==========================================================================
+# Native runtime binaries — users must download themselves
+# (see README "部署 / Deployment" section)
+# ==========================================================================
+# mpv (~114 MB) — https://mpv.io/installation/
+libmpv-2.dll
+mpv-2.dll
+mpv.exe
+
+# Deno runtime (~123 MB) — needed by yt-dlp for YouTube JS challenge solver.
+# Place at repo root or anywhere in PATH. https://deno.com/
+deno.exe
+deno
+
+# ==========================================================================
+# Model weights — large, must be downloaded via download_models.py
+# ==========================================================================
+# Repo-local model dir (kept as empty placeholder if needed)
+models/**
+!models/.gitkeep
+
+# Generic weight extensions, in case anything is dropped at repo root
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+
+# ==========================================================================
+# User-level runtime state (lives in $HOME, not the repo, but guard anyway)
+# ==========================================================================
+.ventiplayer/
+.cache/
+
+# ==========================================================================
+# Cookies — contain login sessions, must NEVER be committed
+# ==========================================================================
+cookies/
+cookies.txt
+cookies_*.txt
+*.cookies
+
+# ==========================================================================
+# Generated / runtime output
+# ==========================================================================
+*.log
+logs/
+tmp/
+temp/
+ventiplayer_*/
+
+# Generated shader variants (written at runtime by VideoEnhancePanel)
+shaders/CAS_active.glsl
+shaders/FSR_active.glsl
+
+# Audio artifacts that may be dropped during testing
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.opus
+*.webm
+
+# Video artifacts (manual test captures)
+*.mp4
+*.mkv
+*.mov

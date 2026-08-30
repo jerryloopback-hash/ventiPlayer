@@ -1,0 +1,25 @@
+PySide6>=6.6
+python-mpv>=1.0
+yt-dlp>=2024.0
+numpy>=1.24
+
+# Phase 2: AI Audio Enhancement (Apollo codec-repair + FlashSR super-resolution)
+# Both models are vendored under src/models/{apollo_src,flashsr_src}/ (not on PyPI).
+# Their inference paths are pure PyTorch — ROCm/DirectML friendly, no CUDA-only kernels.
+torch>=2.4
+av>=12.0
+soundfile>=0.12
+scipy>=1.10        # polyphase resampling + FlashSR overlap-add
+librosa>=0.10      # audio I/O / mel utils used by the vendored model code
+einops>=0.7        # tensor ops in FlashSR / TorchJaekwon
+
+# Phase 7: Subtitle Generation
+transformers>=4.40
+httpx>=0.27
+
+# Phase 6: 视频帧生成
+# - display-resample 伪插帧：mpv 内置，无需任何额外依赖。
+# - 小黄鸭 (Lossless Scaling) 全屏补帧：外部 Windows 程序（Steam 付费应用），不通过 pip 安装。
+#   在设置中填写 LosslessScaling.exe 的绝对路径即可；VentiPlayer 通过其全局快捷键驱动。
+#   早期内置的 SVP(svpflow)/RIFE(vsrife/vapoursynth) 真补帧后端已移除，相关依赖不再需要。
+
