@@ -322,12 +322,18 @@ class EnhancePanel(QWidget):
             self._enhance_btn.setText("重新修复")
         else:
             self._enhance_btn.setText("修复当前音频")
+            self._progress.setRange(0, 100)
             self._progress.setValue(0)
             self._progress.set_playback_ratio(-1.0)
             self._status_label.setText("")
 
     def update_progress(self, progress: float, message: str = ""):
-        self._progress.setValue(int(progress * 100))
+        """progress < 0 表示总长未知 → 进度条切换为忙碌（来回滑动）指示。"""
+        if progress < 0:
+            self._progress.setRange(0, 0)
+        else:
+            self._progress.setRange(0, 100)
+            self._progress.setValue(int(progress * 100))
         if message:
             self._status_label.setText(message)
             self._status_label.show()

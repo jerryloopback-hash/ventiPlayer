@@ -8,7 +8,6 @@ Source vendored under src/models/apollo_src/. License: CC-BY-SA 4.0.
 """
 
 import logging
-from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -34,6 +33,8 @@ _FADE_S = 0.5            # crossfade / overlap length in seconds
 
 class ApolloModel:
     """High-level Apollo inference wrapper (stereo, 44.1 kHz, single pass)."""
+
+    native_sr = APOLLO_SR  # 流式管线用：模型工作采样率
 
     def __init__(self, device_info: DeviceInfo, use_fp16: bool = False):
         self._device_info = device_info
@@ -136,7 +137,6 @@ class ApolloModel:
         fade_in = torch.linspace(0.0, 1.0, fade)
         fade_out = torch.linspace(1.0, 0.0, fade)
 
-        n_chunks = max(1, (n_samples + step - 1) // step)
         i = 0
         idx = 0
         while i < n_samples:
@@ -184,6 +184,29 @@ class ApolloModel:
         with torch.autocast("cuda", dtype=torch.float16, enabled=self._use_fp16):
             out = self._model(x)                  # (1, nch, T)
         return out.float().squeeze(0).cpu()
+
+    # --- 流式接口（AudioPipeline 边解码边推理用；与批量 enhance() 等价） ---
+
+    def check_vram(self):
+        """公开的显存检查入口（CUDA 上可用显存过低时抛 RuntimeError）。"""
+        if self._device.type == "cuda":
+            self._check_vram()
+
+    def stream_infer(self, win: torch.Tensor) -> torch.Tensor:
+        """单窗口推理：(nch, window) CPU 入 → (nch, window) CPU float32 出。"""
+        with torch.no_grad():
+            return self._process_chunk(win)
+
+    def make_stream_ola(self, nch: int):
+        """构建流式 overlap-add 处理器（参数与批量 enhance() 的分块一致）。"""
+        from src.models.stream_ola import StreamingOLA
+        window, fade = int(_CHUNK_S * APOLLO_SR), int(_FADE_S * APOLLO_SR)
+        t = torch.linspace(0.0, 1.0, fade)
+        return StreamingOLA(
+            nch, window, window - fade, fade,
+            infer_fn=self.stream_infer,
+            fade_in_vec=t, fade_out_vec=1.0 - t,
+        )
 
     @staticmethod
     def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:

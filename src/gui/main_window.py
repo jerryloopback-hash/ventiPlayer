@@ -196,7 +196,10 @@ class MainWindow(
                 pass
         self._sync.cleanup()
         self._pipeline.cleanup()
-        self._enhancer.unload()
+        # 后台加载/推理线程若还在跑，GPU 锁被占 → 跳过释放，交由线程退出，
+        # 避免 unload 与在途 .to(cuda)/warmup 竞争导致退出闪退
+        if not self._enhancer.unload_if_idle():
+            logger.info("后台增强线程仍在运行，跳过退出时的模型释放")
         self._thumbnail_cache.shutdown()
         # 退出时务必终止小黄鸭进程（已确认接受可能误杀用户自开实例）
         try:

@@ -13,7 +13,6 @@ from PySide6.QtWidgets import QMessageBox
 
 from src.core.playlist import VideoItem
 from src.core.stream import StreamInfo
-from src.core.audio_pipe import PipelineState
 from src.core.bilibili_api import BiliVideoInfo
 
 logger = logging.getLogger(__name__)
@@ -451,14 +450,9 @@ class PlaybackMixin:
                 self._enhance_panel.update_playback_marker(
                     pos / self._player_widget.duration
                 )
-        # Auto-fallback if playback approaches end of enhanced coverage
-        if self._enhanced_playing and self._enhanced_duration_s > 0:
-            pipeline_state = self._pipeline.status.state
-            if pipeline_state != PipelineState.READY and pos > self._enhanced_duration_s - 3.0:
-                self._sync.deactivate_enhanced()
-                self._enhanced_playing = False
-                self._update_media_info()
-                self._status_label.setText("播放位置接近增强边界 — 回退到源音频")
+        # 注：增强结果是整轨 WAV（覆盖全曲），无需轮询"接近增强边界就回退"。
+        # 该机制是早期流式增量设计的遗留，且会在重新增强期间误杀正在播放的
+        # 旧增强音频。越界防护由 _on_seek_performed 的 seek 检查承担。
 
     @Slot(float)
     def _update_duration(self, dur: float):

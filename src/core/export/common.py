@@ -12,8 +12,8 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录（libmpv-2.dll 所在）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# 项目根目录（libmpv-2.dll 所在）—— 本文件位于 src/core/export/，向上 4 层
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 # 进度回调签名：callback(progress: float 0..1, message: str)
 ProgressCallback = Callable[[float, str], None]

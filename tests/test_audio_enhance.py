@@ -1,14 +1,16 @@
-"""音频增强重构单元测试：enhancer 组合链 + audio_pipe 立体声 + 可用性探测。
+"""音频增强单元测试：enhancer 组合链 + 流式 OLA/重采样等价性 + 流式管线。
 
 mock 掉 Apollo/FlashSR 模型，无需真实权重或 GPU。
 运行：.venv312/Scripts/python.exe tests/test_audio_enhance.py
 """
 
 import sys
+import threading
 import unittest
 from unittest import mock
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
@@ -115,6 +117,16 @@ class TestEnhancerChain(unittest.TestCase):
         e.load_models()
         self.assertEqual(load_count["n"], 2)
 
+    def test_load_errors_recorded_by_name(self):
+        """加载失败时按名记录，供 UI 指名道姓地报错。"""
+        e = self._enhancer()
+        e.set_apollo_enabled(True)
+        e.set_flashsr_enabled(True)
+        e._load_apollo = lambda: False
+        e._load_flashsr = lambda: True
+        self.assertFalse(e.load_models())
+        self.assertEqual(e.last_load_errors, ["Apollo"])
+
 
 class TestAvailability(unittest.TestCase):
 
@@ -135,58 +147,251 @@ class TestAvailability(unittest.TestCase):
         self.assertTrue(avail["flashsr"])
 
 
-class TestAudioPipeStereo(unittest.TestCase):
-    """解码 → 增强 → 写 WAV 的立体声往返（mock enhancer + PyAV，真实 soundfile）。"""
+# ─── 流式组件等价性 ──────────────────────────────────────────────────────
+
+def _batch_ola_reference(x: np.ndarray, window: int, hop: int, fade: int,
+                         infer, mode: str) -> np.ndarray:
+    """批量 enhance() 的 overlap-add 参照实现（复刻 Apollo/FlashSR 循环）。
+
+    mode: "apollo"（互补 fade）/"flashsr"（仅后窗 fade_in）。"""
+    nch, n = x.shape
+    xt = torch.from_numpy(x)
+    result = torch.zeros(nch, n)
+    counter = torch.zeros(nch, n)
+    fin = torch.linspace(0.0, 1.0, fade)
+    fout = 1.0 - fin
+    i = 0
+    while i < n:
+        length = min(window, n - i)
+        part = xt[:, i:i + length]
+        if length < window:
+            part = torch.nn.functional.pad(part, (0, window - length))
+        out = infer(part)[:, :length]
+        w = torch.ones(length)
+        if i > 0 and length > fade:
+            w[:fade] = fin
+        if mode == "apollo" and (i + hop) < n and length > fade:
+            w[length - fade:] = fout
+        result[:, i:i + length] += out * w
+        counter[:, i:i + length] += w
+        i += hop
+    counter.clamp_(min=1e-8)
+    return (result / counter).numpy()
+
+
+def _context_infer():
+    """带上下文的推理：沿时间做小 FIR，输出依赖窗口内相邻样本，
+    能检验接缝权重与 padding 是否与批量版一致（纯点状映射会掩盖权重错误）。"""
+    k = torch.tensor([0.2, 0.5, 0.2, 0.1])
+
+    def infer(w: torch.Tensor) -> torch.Tensor:
+        padded = torch.nn.functional.pad(w, (len(k) - 1, 0))
+        return torch.nn.functional.conv1d(
+            padded.unsqueeze(1), k.flip(0).view(1, 1, -1)).squeeze(1)
+
+    return infer
+
+
+class TestStreamingOLA(unittest.TestCase):
+    """StreamingOLA 必须与批量 overlap-add 逐样本一致。"""
+
+    W, H, F = 100, 70, 30  # window = hop + fade
+
+    def _run_stream(self, x, mode, block_size):
+        from src.models.stream_ola import StreamingOLA
+        fin = torch.linspace(0.0, 1.0, self.F)
+        fout = 1.0 - fin if mode == "apollo" else None
+        ola = StreamingOLA(x.shape[0], self.W, self.H, self.F,
+                           infer_fn=_context_infer(),
+                           fade_in_vec=fin, fade_out_vec=fout)
+        outs = []
+        pos = 0
+        while pos < x.shape[1]:
+            xb = x[:, pos:pos + block_size]
+            last = pos + block_size >= x.shape[1]
+            out = ola.process(xb, last=last)
+            if out is not None:
+                outs.append(out)
+            pos += block_size
+        # 收尾空块：触发 OLA 处理剩余不足一窗的尾部
+        tail = ola.process(np.zeros((x.shape[0], 0), np.float32), last=True)
+        if tail is not None:
+            outs.append(tail)
+        return np.concatenate(outs, axis=1)
+
+    def _check(self, n, mode, block_size):
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((2, n)).astype(np.float32) * 0.1
+        got = self._run_stream(x, mode, block_size)
+        ref = _batch_ola_reference(
+            x, self.W, self.H, self.F, _context_infer(), mode)
+        self.assertEqual(got.shape[1], n, f"n={n} mode={mode} block={block_size}")
+        np.testing.assert_allclose(
+            got, ref, atol=1e-5,
+            err_msg=f"n={n} mode={mode} block={block_size}")
+
+    def test_apollo_various_lengths(self):
+        for n in (10, self.F + 1, self.W - 1, self.W, self.W + 1,
+                  2 * self.H, 3 * self.H, 3 * self.H + 1, 5 * self.W):
+            for block in (37, 71, 1000):
+                self._check(n, "apollo", block)
+
+    def test_flashsr_various_lengths(self):
+        for n in (10, self.W, self.W + 1, 2 * self.H, 3 * self.H, 5 * self.W):
+            self._check(n, "flashsr", 71)
+
+    def test_exact_multiple_of_hop(self):
+        # 输入恰为 hop 整数倍：末窗只覆盖 hop 个真实样本
+        for mode in ("apollo", "flashsr"):
+            self._check(3 * self.H, mode, 500)
+            self._check(4 * self.H, mode, self.H)
+
+
+class TestStreamingResampler(unittest.TestCase):
+    """流式分块重采样必须与整轨 resample_poly 一致（除极边缘样本）。"""
+
+    def test_44100_to_48000(self):
+        from scipy.signal import resample_poly
+        from src.models.stream_ola import StreamingResampler
+        rng = np.random.default_rng(7)
+        x = rng.standard_normal((2, 50000)).astype(np.float32) * 0.1
+        whole = np.stack([resample_poly(ch, 160, 147) for ch in x])
+
+        rs = StreamingResampler(44100, 48000, 2)
+        outs = []
+        pos = 0
+        block = 4096
+        while pos < x.shape[1]:
+            xb = x[:, pos:pos + block]
+            last = pos + block >= x.shape[1]
+            outs.append(rs.process(xb, last=last))
+            pos += block
+        stream = np.concatenate(outs, axis=1)
+
+        self.assertLess(abs(stream.shape[1] - whole.shape[1]), 3)
+        m = min(stream.shape[1], whole.shape[1])
+        np.testing.assert_allclose(
+            stream[:, 200:m - 200], whole[:, 200:m - 200], atol=1e-4)
+
+    def test_same_rate_passthrough(self):
+        from src.models.stream_ola import StreamingResampler
+        rs = StreamingResampler(48000, 48000, 2)
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((2, 10000)).astype(np.float32)
+        out = rs.process(x, last=True)
+        np.testing.assert_allclose(out, x, atol=1e-6)
+
+
+# ─── 流式管线端到端 ──────────────────────────────────────────────────────
+
+class _FakeStreamModel:
+    """假模型：native_sr 固定、推理 = 输入 × 2 的线性映射。"""
+
+    def __init__(self, native_sr):
+        self.native_sr = native_sr
+        self.vram_checked = False
+
+    def check_vram(self):
+        self.vram_checked = True
+
+    def make_stream_ola(self, nch):
+        from src.models.stream_ola import StreamingOLA
+        window, hop, fade = 4000, 3000, 1000
+        return StreamingOLA(
+            nch, window, hop, fade,
+            infer_fn=lambda w: w * 2.0,
+            fade_in_vec=torch.linspace(0, 1, fade), fade_out_vec=None,
+        )
+
+
+def _fake_enhancer(models):
+    enh = mock.MagicMock()
+    enh.gpu_lock = threading.Lock()
+    enh.stream_chain.side_effect = lambda: list(models)
+    return enh
+
+
+class TestAudioPipeStreaming(unittest.TestCase):
+    """解码 → 增强 → 写 WAV 的流式端到端（mock 解码与模型，真实 soundfile）。"""
+
+    def _make_pipe(self, models):
+        from src.core.audio_pipe import AudioPipeline
+        pipe = AudioPipeline(_fake_enhancer(models))
+        self.addCleanup(pipe.cleanup)
+        return pipe
 
     def test_stereo_roundtrip_writes_2ch_wav(self):
         import soundfile as sf
-        from src.core.audio_pipe import AudioPipeline, PipelineState
+        from src.core.audio_pipe import PipelineState
 
-        # enhancer that returns stereo unchanged at 48k
-        enhancer = mock.MagicMock()
-        enhancer.enhance_full.side_effect = (
-            lambda audio, sr, progress_callback=None: (audio, 48000)
-        )
+        model = _FakeStreamModel(48000)
+        pipe = self._make_pipe([model])
 
-        pipe = AudioPipeline(enhancer)
-        # bypass PyAV: feed a known stereo array
-        stereo = np.random.randn(2, 24000).astype(np.float32) * 0.1
-        pipe._decode_full_audio = mock.MagicMock(return_value=(stereo, 48000))
+        block1 = np.ones((2, 5000), dtype=np.float32) * 0.5
+        block2 = np.ones((2, 9000), dtype=np.float32) * 0.5
+        pipe._decode_stream = lambda url, headers: (
+            48000, 0.0, iter([(block1, False), (block2, True)]))
 
         statuses = []
         pipe.set_status_callback(lambda s: statuses.append(s))
-        # call worker synchronously with matching generation
-        pipe._generation = 1
-        pipe._worker("fake://url", None, 1)
+        pipe._worker("fake://url", None, 0.0, gen=1)
 
         final = pipe.status
         self.assertEqual(final.state, PipelineState.READY)
-        self.assertIsNotNone(final.enhanced_file)
+        self.assertEqual(final.source_url, "fake://url")
+        self.assertEqual(final.output_sr, 48000)
+        self.assertTrue(model.vram_checked)
         data, sr = sf.read(final.enhanced_file, dtype="float32")
         self.assertEqual(sr, 48000)
         self.assertEqual(data.ndim, 2)
-        self.assertEqual(data.shape[1], 2)  # stereo preserved
-        pipe.cleanup()
+        self.assertEqual(data.shape[1], 2)   # stereo preserved
+        self.assertEqual(data.shape[0], 5000 + 9000)
+        # 线性模型（×2）+ 归一化 OLA → 输出恰为输入 ×2
+        expected = np.vstack([block1.T, block2.T]) * 2.0
+        np.testing.assert_allclose(data, expected, atol=1e-6)
 
-    def test_mono_roundtrip_writes_1ch(self):
+    def test_resample_stage_inserted_for_wrong_sr(self):
+        """源采样率 ≠ 模型 native_sr 时应自动插入重采样阶段。"""
         import soundfile as sf
-        from src.core.audio_pipe import AudioPipeline, PipelineState
+        from src.core.audio_pipe import PipelineState
 
-        enhancer = mock.MagicMock()
-        enhancer.enhance_full.side_effect = (
-            lambda audio, sr, progress_callback=None: (audio, 44100)
-        )
-        pipe = AudioPipeline(enhancer)
-        mono = np.random.randn(1, 12000).astype(np.float32) * 0.1
-        pipe._decode_full_audio = mock.MagicMock(return_value=(mono, 44100))
-        pipe._generation = 1
-        pipe._worker("fake://url", None, 1)
+        model = _FakeStreamModel(48000)
+        pipe = self._make_pipe([model])
+        n = 10000
+        x = np.linspace(-1, 1, n, dtype=np.float32)[np.newaxis, :]
+        pipe._decode_stream = lambda url, headers: (
+            44100, 0.0, iter([(x, True)]))
+        pipe._worker("fake://url", None, 0.0, gen=1)
 
-        data, sr = sf.read(pipe.status.enhanced_file, dtype="float32")
-        self.assertEqual(sr, 44100)
-        # soundfile returns 1-D for mono
-        self.assertEqual(data.ndim, 1)
-        pipe.cleanup()
+        final = pipe.status
+        self.assertEqual(final.state, PipelineState.READY)
+        self.assertEqual(final.output_sr, 48000)
+        data, sr = sf.read(final.enhanced_file, dtype="float32")
+        self.assertEqual(sr, 48000)
+        # 44100→48000 重采样后长度应略增
+        self.assertGreater(data.shape[0], n)
+        self.assertLess(data.shape[0], int(n * 48000 / 44100) + 16)
+
+    def test_cancelled_decode_raises_no_ready(self):
+        """取消事件置位后 worker 不产出 READY。"""
+        from src.core.audio_pipe import PipelineState
+
+        model = _FakeStreamModel(48000)
+        pipe = self._make_pipe([model])
+        pipe._cancel.set()
+        x = np.ones((2, 5000), dtype=np.float32) * 0.5
+
+        def decode(url, headers):
+            def gen():
+                if pipe._cancel.is_set():
+                    raise InterruptedError
+                yield x, False
+                yield np.zeros((2, 0), np.float32), True
+            return 48000, 0.0, gen()
+
+        pipe._decode_stream = decode
+        pipe._worker("fake://url", None, 0.0, gen=1)
+        self.assertEqual(pipe.status.state, PipelineState.IDLE)
 
 
 if __name__ == "__main__":

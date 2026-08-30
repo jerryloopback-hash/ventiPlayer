@@ -243,6 +243,10 @@ class UiSetupMixin:
         self._output_sr: int = 0  # actual output sample rate from mpv
         self._enhanced_duration_s: float = 0.0  # seconds of enhanced audio available
         self._enhanced_output_sr: int = 0  # SR of enhanced output (Apollo 44.1k / FlashSR 48k)
+        # 音频增强任务状态：busy 期间忽略再次点击（防并发加载/推理导致 ROCm 原生崩溃）
+        self._enhance_busy: bool = False
+        # 当前增强请求的取消事件（每次请求新建，避免旧请求线程读到新请求的状态）
+        self._enhance_abort_evt = None
         # 当前正在播放的增强音频实际采用的方案标签，如 "Apollo(fp32)+FlashSR(fp16)"
         # 在 _on_enhance_requested 发起增强时捕获，避免被事后改动的勾选状态影响
         self._enhanced_scheme_label: str = ""

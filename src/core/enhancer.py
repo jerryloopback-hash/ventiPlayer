@@ -9,6 +9,7 @@ series (Apollo → FlashSR):
 """
 
 import logging
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -80,6 +81,11 @@ class Enhancer:
         self._flashsr_fp16 = False
         self._apollo_loaded_fp16 = None   # precision the loaded model was built with
         self._flashsr_loaded_fp16 = None
+        # 串行化所有模型生命周期与 GPU 推理：并发 .to(cuda)/warmup/推理在
+        # ROCm/HIP 上有原生崩溃风险（Python try/except 拦不住 abort）
+        self._lock = threading.Lock()
+        # 最近一次 load_models() 中加载失败的模型名（空列表 = 全部成功）
+        self.last_load_errors: list = []
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -107,13 +113,23 @@ class Enhancer:
     def any_enabled(self) -> bool:
         return self._apollo_enabled or self._flashsr_enabled
 
+    @property
+    def gpu_lock(self) -> threading.Lock:
+        """GPU 串行锁：长任务（流式增强）在 worker 侧显式持有。"""
+        return self._lock
+
     def load_models(self) -> bool:
         """Load the enabled backends, unload the disabled ones. Reload a backend
         if its precision (fp16/fp32) changed. True if all enabled models loaded
-        successfully (and at least one is enabled)."""
+        successfully (and at least one is enabled). 失败的模型名记入 last_load_errors。"""
         if not self.any_enabled:
             return False
 
+        with self._lock:
+            return self._load_models_locked()
+
+    def _load_models_locked(self) -> bool:
+        self.last_load_errors = []
         ok = True
         # Apollo — reload if precision changed
         if self._apollo_enabled:
@@ -121,7 +137,9 @@ class Enhancer:
                 self._apollo.unload()
                 self._apollo = None
             if self._apollo is None:
-                ok = self._load_apollo() and ok
+                if not self._load_apollo():
+                    self.last_load_errors.append("Apollo")
+                    ok = False
         elif self._apollo is not None:
             self._apollo.unload()
             self._apollo = None
@@ -132,7 +150,9 @@ class Enhancer:
                 self._flashsr.unload()
                 self._flashsr = None
             if self._flashsr is None:
-                ok = self._load_flashsr() and ok
+                if not self._load_flashsr():
+                    self.last_load_errors.append("FlashSR")
+                    ok = False
         elif self._flashsr is not None:
             self._flashsr.unload()
             self._flashsr = None
@@ -159,6 +179,19 @@ class Enhancer:
         logger.info("FlashSR model loaded")
         return True
 
+    def stream_chain(self) -> list:
+        """返回启用且已加载的模型列表（按 Apollo → FlashSR 顺序），供流式管线。
+
+        无可用模型时抛 RuntimeError。"""
+        stages = []
+        if self._apollo_enabled and self._apollo is not None:
+            stages.append(self._apollo)
+        if self._flashsr_enabled and self._flashsr is not None:
+            stages.append(self._flashsr)
+        if not stages:
+            raise RuntimeError("没有可用的增强模型（Apollo/FlashSR 均未加载）")
+        return stages
+
     def enhance_full(self, audio: np.ndarray, input_sr: int,
                      progress_callback: Optional[Callable[[float], None]] = None) -> tuple:
         """Run the enabled restoration chain on full audio.
@@ -171,14 +204,12 @@ class Enhancer:
         Returns:
             (enhanced float32 shape (channels, samples), output_sr)
         """
-        stages = []
-        if self._apollo_enabled and self._apollo is not None:
-            stages.append(self._apollo)
-        if self._flashsr_enabled and self._flashsr is not None:
-            stages.append(self._flashsr)
+        with self._lock:
+            return self._enhance_full_locked(audio, input_sr, progress_callback)
 
-        if not stages:
-            raise RuntimeError("没有可用的增强模型（Apollo/FlashSR 均未加载）")
+    def _enhance_full_locked(self, audio: np.ndarray, input_sr: int,
+                             progress_callback: Optional[Callable[[float], None]] = None) -> tuple:
+        stages = self.stream_chain()
 
         n = len(stages)
         cur = audio
@@ -194,6 +225,21 @@ class Enhancer:
         return cur, cur_sr
 
     def unload(self):
+        """释放模型（阻塞等待锁 —— 调用方需确认无长任务在跑）。"""
+        with self._lock:
+            self._unload_locked()
+
+    def unload_if_idle(self) -> bool:
+        """空闲时释放模型；GPU 锁被占用（加载/推理进行中）则不动并返回 False。"""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._unload_locked()
+            return True
+        finally:
+            self._lock.release()
+
+    def _unload_locked(self):
         if self._apollo is not None:
             self._apollo.unload()
             self._apollo = None

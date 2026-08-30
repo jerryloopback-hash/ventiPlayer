@@ -10,7 +10,6 @@ License: inference code Apache-2.0; weights inherit AudioSR (MIT).
 
 import logging
 import math
-import os
 import sys
 from pathlib import Path
 from typing import Callable, Optional
@@ -38,6 +37,8 @@ _HOP = _WINDOW_LEN - _OVERLAP
 
 class FlashSRModel:
     """High-level FlashSR inference wrapper (per-channel, outputs 48 kHz)."""
+
+    native_sr = FLASHSR_SR  # 流式管线用：模型工作采样率
 
     def __init__(self, device_info: DeviceInfo, use_fp16: bool = False):
         self._device_info = device_info
@@ -185,6 +186,30 @@ class FlashSRModel:
         with torch.autocast("cuda", dtype=torch.float16, enabled=self._use_fp16):
             out = self._model(seg, lowpass_input=False)
         return out.float()
+
+    # --- 流式接口（AudioPipeline 边解码边推理用；与批量 enhance() 等价） ---
+
+    def check_vram(self):
+        """公开的显存检查入口（CUDA 上可用显存过低时抛 RuntimeError）。"""
+        if self._device.type == "cuda":
+            self._check_vram()
+
+    def stream_infer(self, win: torch.Tensor) -> torch.Tensor:
+        """单窗口推理：(nch, window) CPU 入 → (nch, window) CPU float32 出。"""
+        with torch.no_grad():
+            return self._infer(win.to(self._device)).cpu()
+
+    def make_stream_ola(self, nch: int):
+        """构建流式 overlap-add 处理器（参数与批量 enhance() 的分块一致）。
+
+        FlashSR 批量版接缝只对后窗施加 fade_in（前窗权重 1），故无 fade_out。"""
+        from src.models.stream_ola import StreamingOLA
+        t = torch.linspace(0.0, math.pi / 2, _OVERLAP)
+        return StreamingOLA(
+            nch, _WINDOW_LEN, _HOP, _OVERLAP,
+            infer_fn=self.stream_infer,
+            fade_in_vec=torch.sin(t) ** 2, fade_out_vec=None,
+        )
 
     @staticmethod
     def _build_fade(length: int) -> torch.Tensor:
