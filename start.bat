@@ -11,9 +11,9 @@ set HF_ENDPOINT=https://hf-mirror.com
 set HF_HUB_DISABLE_SYMLINKS_WARNING=1
 set PYTORCH_ALLOC_CONF=expandable_segments:True
 if not exist "%~dp0.miopen_cache" mkdir "%~dp0.miopen_cache"
-rem stdout/stderr é‡å®šå‘åˆ°æ—¥å¿—ï¼šåŸç”Ÿé—ªé€€ï¼ˆMIOpen/HIP abort ç­‰ï¼‰çš„æŠ¥é”™ä¹Ÿèƒ½ç•™ç—•ï¼Œ
-rem æ¯æ¬¡å¯åŠ¨è¦†ç›–ä¸Šæ¬¡æ—¥å¿—ï¼Œåªä¿ç•™æœ€è¿‘ä¸€æ¬¡è¿è¡Œçš„å®Œæ•´è¾“å‡ºã€‚
+rem stdout/stderr ÖØ¶¨Ïòµ½ÈÕÖ¾£ºÔ­ÉúÉÁÍË£¨MIOpen/HIP abort µÈ£©µÄ±¨´íÒ²ÄÜÁôºÛ£¬
+rem Ã¿´ÎÆô¶¯¸²¸ÇÉÏ´ÎÈÕÖ¾£¬Ö»±£Áô×î½üÒ»´ÎÔËĞĞµÄÍêÕûÊä³ö¡£
 if not exist "%~dp0log" mkdir "%~dp0log"
 .venv312\Scripts\python.exe run.py > "%~dp0log\ventiplayer.log" 2>&1
-echo ç¨‹åºå·²é€€å‡ºã€‚è‹¥å‘ç”Ÿé—ªé€€ï¼Œè¯·æŠŠ log\ventiplayer.log å‘ç»™å¼€å‘è€…åˆ†æã€‚
+echo ³ÌĞòÒÑÍË³ö¡£Èô·¢ÉúÉÁÍË£¬Çë°Ñ log\ventiplayer.log ·¢¸ø¿ª·¢Õß·ÖÎö¡£
 pause
