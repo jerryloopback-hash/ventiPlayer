@@ -4,7 +4,10 @@ mock 掉 Apollo/FlashSR 模型，无需真实权重或 GPU。
 运行：.venv312/Scripts/python.exe tests/test_audio_enhance.py
 """
 
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -304,6 +307,55 @@ class _FakeStreamModel:
         )
 
 
+class TestProgressiveWav(unittest.TestCase):
+    """预分配渐进 WAV：头尺寸恒定、未写区域读回零、finalize 修正到实际长度。"""
+
+    def test_presized_header_progressive_write_finalize(self):
+        import soundfile as sf
+        from src.core.audio_pipe import _ProgressiveWav
+
+        d = tempfile.mkdtemp(prefix="venti_test_")
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "out.wav")
+        sr, nch = 48000, 2
+        estimated = 10000
+        w = _ProgressiveWav(path, sr, nch, estimated)
+        # 创建后文件即为"完整"尺寸（估计长度），mpv 可安全打开
+        self.assertEqual(os.path.getsize(path), 44 + estimated * nch * 4)
+        b1 = np.ones((nch, 4000), dtype=np.float32) * 0.5
+        b2 = np.ones((nch, 3500), dtype=np.float32) * 0.25
+        w.write(b1)
+        w.write(b2)
+        # 未 finalize 时读文件：已写区域是数据，未写区域是零
+        data, _ = sf.read(path, dtype="float32")
+        self.assertEqual(data.shape[0], estimated)  # 头声称全尺寸
+        np.testing.assert_allclose(data[:4000], b1.T, atol=1e-6)
+        np.testing.assert_allclose(data[4000:7500], b2.T, atol=1e-6)
+        np.testing.assert_allclose(data[7500:], 0.0, atol=1e-9)
+        # finalize：截断到实际长度并修正头
+        w.finalize()
+        data, sr2 = sf.read(path, dtype="float32")
+        self.assertEqual(sr2, sr)
+        self.assertEqual(data.shape[0], 7500)
+        np.testing.assert_allclose(data[:4000], b1.T, atol=1e-6)
+        np.testing.assert_allclose(data[4000:], b2.T, atol=1e-6)
+
+    def test_actual_exceeds_estimate(self):
+        import soundfile as sf
+        from src.core.audio_pipe import _ProgressiveWav
+
+        d = tempfile.mkdtemp(prefix="venti_test_")
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "out.wav")
+        w = _ProgressiveWav(path, 44100, 1, 100)
+        x = np.ones((1, 500), dtype=np.float32) * 0.3  # 远超预分配
+        w.write(x)
+        w.finalize()
+        data, _ = sf.read(path, dtype="float32")
+        self.assertEqual(data.shape[0], 500)
+        np.testing.assert_allclose(np.ravel(data), x[0], atol=1e-6)
+
+
 def _fake_enhancer(models):
     enh = mock.MagicMock()
     enh.gpu_lock = threading.Lock()
@@ -371,6 +423,36 @@ class TestAudioPipeStreaming(unittest.TestCase):
         # 44100→48000 重采样后长度应略增
         self.assertGreater(data.shape[0], n)
         self.assertLess(data.shape[0], int(n * 48000 / 44100) + 16)
+
+    def test_progressive_mode_reports_frontier(self):
+        """总时长已知 → 渐进模式：ENHANCING 状态携带文件与递增写入前沿。"""
+        import soundfile as sf
+        from src.core.audio_pipe import PipelineState
+
+        model = _FakeStreamModel(48000)
+        pipe = self._make_pipe([model])
+        b1 = np.ones((2, 5000), np.float32) * 0.5
+        b2 = np.ones((2, 4000), np.float32) * 0.5
+        pipe._decode_stream = lambda url, headers: (
+            48000, 30.0, iter([(b1, False), (b2, True)]))
+
+        statuses = []
+        pipe.set_status_callback(lambda s: statuses.append(s))
+        pipe._worker("fake://url", None, 0.0, gen=1)
+
+        final = pipe.status
+        self.assertEqual(final.state, PipelineState.READY)
+        enh = [s for s in statuses
+               if s.state == PipelineState.ENHANCING and s.enhanced_file]
+        self.assertTrue(enh, "渐进模式必须在 ENHANCING 阶段上报增强文件")
+        self.assertTrue(all(s.source_url == "fake://url" for s in enh))
+        fronts = [s.enhanced_duration_s for s in enh]
+        self.assertEqual(fronts, sorted(fronts), "写入前沿必须单调递增")
+        self.assertAlmostEqual(enh[0].enhanced_duration_s, 3000 / 48000, places=5)
+        # finalize 截断到实际长度（而非预分配长度）
+        data, sr = sf.read(final.enhanced_file, dtype="float32")
+        self.assertEqual(sr, 48000)
+        self.assertEqual(data.shape[0], 9000)
 
     def test_cancelled_decode_raises_no_ready(self):
         """取消事件置位后 worker 不产出 READY。"""

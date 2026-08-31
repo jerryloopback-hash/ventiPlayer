@@ -13,9 +13,15 @@ from PySide6.QtWidgets import QMessageBox
 
 from src.core.playlist import VideoItem
 from src.core.stream import StreamInfo
+from src.core.audio_pipe import PipelineState
 from src.core.bilibili_api import BiliVideoInfo
 
 logger = logging.getLogger(__name__)
+
+# 渐进切换阈值（用户指定）：升频写入前沿领先播放位置 ≥ 5s 时自动切到增强音频
+_SWITCH_AHEAD_S = 5.0
+# 播放位置逼近写入前沿的余量：不足 3s 时暂回源音频，防止追上静音区
+_FALLBACK_MARGIN_S = 3.0
 
 
 class PlaybackMixin:
@@ -450,9 +456,37 @@ class PlaybackMixin:
                 self._enhance_panel.update_playback_marker(
                     pos / self._player_widget.duration
                 )
-        # 注：增强结果是整轨 WAV（覆盖全曲），无需轮询"接近增强边界就回退"。
-        # 该机制是早期流式增量设计的遗留，且会在重新增强期间误杀正在播放的
-        # 旧增强音频。越界防护由 _on_seek_performed 的 seek 检查承担。
+        self._progressive_audio_switch(pos)
+
+    def _progressive_audio_switch(self, pos: float):
+        """渐进切换（恢复历史行为，阈值按用户指定为领先 5s）：
+
+        增强进行中，升频写入前沿（progressive WAV 已写秒数）领先播放位置
+        ≥ 5s 时自动切到增强音频；播放逼近前沿（余量 < 3s，增强慢于实时时
+        会发生）则暂回源音频，待前沿重新领先 5s 再切回。"""
+        status = self._pipeline.status
+        if (status.state != PipelineState.ENHANCING
+                or not status.enhanced_file or not status.source_url):
+            return
+        cur_url = (self._current_stream.audio_url or self._current_stream.video_url
+                   ) if self._current_stream else None
+        if not cur_url or status.source_url != cur_url:
+            return
+        frontier = status.enhanced_duration_s
+        if self._enhanced_playing:
+            if frontier > 0 and pos > frontier - _FALLBACK_MARGIN_S:
+                self._sync.deactivate_enhanced()
+                self._enhanced_playing = False
+                self._update_media_info()
+                self._status_label.setText(
+                    "播放接近升频写入前沿 — 暂回源音频，进度领先后自动切回")
+        elif pos + _SWITCH_AHEAD_S <= frontier:
+            self._enhanced_output_sr = status.output_sr
+            self._sync.activate_enhanced(status.enhanced_file, pos)
+            self._enhanced_playing = True
+            self._update_media_info()
+            self._status_label.setText(
+                f"升频进度领先播放 {int(frontier - pos)}s — 已自动切换到增强音频")
 
     @Slot(float)
     def _update_duration(self, dur: float):

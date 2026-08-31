@@ -80,9 +80,11 @@ class AppInitMixin:
             headers = self._current_stream.http_headers if self._current_stream else None
             self._player_widget.switch_audio_url(path_or_url, headers)
             self._enhanced_playing = False
+            self._active_enhanced_file = None
         else:
             self._player_widget.switch_audio_file(path_or_url)
             self._enhanced_playing = True
+            self._active_enhanced_file = path_or_url
         self._update_media_info()
 
     @Slot(float)

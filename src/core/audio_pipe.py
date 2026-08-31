@@ -57,10 +57,66 @@ class PipelineStatus:
     progress: float = 0.0  # 0..1 = 已升频音频/总音频；-1 = 未知总长，UI 显示忙碌
     message: str = ""
     enhanced_file: Optional[str] = None
+    # 渐进模式下为"写入前沿"（已升频秒数），READY 时为完整时长；0 = 尚不可用
     enhanced_duration_s: float = 0.0
     output_sr: int = 0  # sample rate of the enhanced output (44100 Apollo / 48000 FlashSR)
     recoverable: bool = False  # True if error is recoverable (can fallback)
     source_url: str = ""  # 本次增强的音频源 URL，供 UI 校验是否仍属当前流
+
+
+# 预估总长再加 60s 余量做预分配，防止时长估计偏差导致 mpv 提前 EOF
+_PRESIZE_MARGIN_S = 60.0
+
+
+class _ProgressiveWav:
+    """预分配完整尺寸的 WAV，支持渐进写入（mpv 可安全边写边播）。
+
+    文件创建时即写入声称完整时长的 RIFF 头，并 truncate 到全尺寸（未写区域
+    读回为零 = 静音）。mpv 打开时看到的就是一个"完整"文件：没有增长中文件
+    的 EOF/头重读问题（老方案 growing WAV 的痛点）。全部写完后按实际长度
+    修正头尺寸并截断多余区域。"""
+
+    HDR_SIZE = 44  # 标准 44 字节 RIFF 头（IEEE float32）
+
+    def __init__(self, path: str, sr: int, nch: int, total_frames: int):
+        self._path = path
+        self._sr, self._nch = sr, nch
+        self._frame_size = nch * 4  # float32 交织
+        self._pos = 0               # 已写帧数
+        data_size = total_frames * self._frame_size
+        self._file = open(path, "wb")
+        self._file.write(self._make_header(data_size))
+        self._file.truncate(self.HDR_SIZE + data_size)  # 预分配，未写区域读回零
+
+    def _make_header(self, data_size: int) -> bytes:
+        import struct
+        return (b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
+                + b"fmt " + struct.pack("<IHHIIHH", 16, 3, self._nch, self._sr,
+                                        self._sr * self._frame_size,
+                                        self._frame_size, 32)
+                + b"data" + struct.pack("<I", data_size))
+
+    def write(self, frames: np.ndarray):
+        """追加一块 (nch, T) float32 —— 顺序写入，必须从上次位置继续。"""
+        data = np.ascontiguousarray(frames.T, dtype="<f4").tobytes()
+        self._file.seek(self.HDR_SIZE + self._pos * self._frame_size)
+        self._file.write(data)
+        self._pos += frames.shape[-1]
+
+    def finalize(self):
+        """按实际写入长度修正 RIFF 头尺寸并截断文件（增强正常完成时调用）。"""
+        data_size = self._pos * self._frame_size
+        self._file.truncate(self.HDR_SIZE + data_size)
+        self._file.seek(0)
+        self._file.write(self._make_header(data_size))
+        self._file.close()
+
+    def abort(self):
+        """异常/取消时关闭文件（删除由调用方的 _delete_partial 负责）。"""
+        try:
+            self._file.close()
+        except Exception:
+            pass
 
 
 class _ModelStage:
@@ -324,14 +380,20 @@ class AudioPipeline:
         for m in models:
             m.check_vram()
 
+        # 输出采样率 = 链尾模型的工作采样率（可预先确定）
+        out_sr = int(models[-1].native_sr)
+        # 渐进模式：总时长已知时创建"预分配完整尺寸"的 WAV，边写边可播；
+        # 未知总长则退回整轨完成后才可切换
+        progressive = total_s > 0
+        total_out_frames = int((total_s + _PRESIZE_MARGIN_S) * out_sr) if progressive else 0
+
         stages = None
-        writer = None
-        out_sr = src_sr
+        writer = None  # progressive: _ProgressiveWav；legacy: sf.SoundFile
         written = 0  # 已写出的输出样本数
         nch = 0
 
         def _ensure_stages(channels: int):
-            nonlocal stages, out_sr
+            nonlocal stages
             chain = []
             in_sr = src_sr
             for m in models:
@@ -340,7 +402,6 @@ class AudioPipeline:
                     in_sr = m.native_sr
                 chain.append(_ModelStage(m, channels))
             stages = chain
-            out_sr = int(chain[-1].out_sr)
 
         def _flush(x: np.ndarray, last: bool):
             nonlocal writer, written
@@ -350,11 +411,19 @@ class AudioPipeline:
             if x.shape[1] == 0:
                 return
             if writer is None:
-                writer = sf.SoundFile(str(out_path), "w", samplerate=out_sr,
-                                      channels=x.shape[0], subtype="FLOAT")
-            writer.write(x.T)
+                if progressive:
+                    writer = _ProgressiveWav(str(out_path), out_sr,
+                                             x.shape[0], total_out_frames)
+                else:
+                    writer = sf.SoundFile(str(out_path), "w", samplerate=out_sr,
+                                          channels=x.shape[0], subtype="FLOAT")
+            if progressive:
+                writer.write(x)          # _ProgressiveWav: (nch, T)
+            else:
+                writer.write(x.T)        # SoundFile: (T, nch)
             written += x.shape[1]
-            self._report_progress(written, out_sr, total_s)
+            self._report_progress(written, out_sr, total_s,
+                                  file=str(out_path) if progressive else None)
 
         got_any = False
         for x, is_last in blocks:
@@ -376,7 +445,10 @@ class AudioPipeline:
             raise InterruptedError("增强已取消")
 
         if writer is not None:
-            writer.close()
+            if progressive:
+                writer.finalize()  # 按实际长度修正头尺寸并截断
+            else:
+                writer.close()
 
         enhanced_duration_s = written / out_sr if out_sr else 0.0
         self._update_status(
@@ -389,8 +461,12 @@ class AudioPipeline:
             source_url=audio_url,
         )
 
-    def _report_progress(self, written: int, out_sr: int, total_s: float):
-        """进度条语义：已升频音频时长 / 总音频时长（用户指定的显示方式）。"""
+    def _report_progress(self, written: int, out_sr: int, total_s: float,
+                         file: str = None):
+        """进度条语义：已升频音频时长 / 总音频时长（用户指定的显示方式）。
+
+        file 非 None（渐进模式）时同时上报写入前沿（enhanced_duration_s），
+        供 UI 实现"升频领先播放 5s 自动切换"。"""
         done_s = written / out_sr if out_sr else 0.0
         if total_s > 0:
             frac = min(0.99, done_s / total_s)
@@ -400,7 +476,8 @@ class AudioPipeline:
             frac = -1.0  # 总长未知 → UI 忙碌指示
             msg = f"音频增强中（已处理 {self._fmt_t(done_s)}）"
         self._update_status(state=PipelineState.ENHANCING,
-                            progress=frac, message=msg)
+                            progress=frac, message=msg,
+                            enhanced_file=file, enhanced_duration_s=done_s)
 
     @staticmethod
     def _fmt_t(seconds: float) -> str:

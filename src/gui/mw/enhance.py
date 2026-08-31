@@ -221,14 +221,24 @@ class EnhanceIntegrationMixin:
                     keep=status.enhanced_file))
                 return
 
-            was_playing = self._enhanced_playing
+            was_playing_same = (self._enhanced_playing
+                                and getattr(self, "_active_enhanced_file", None)
+                                == status.enhanced_file)
+            if was_playing_same:
+                # 已在渐进播放本文件：前沿即完整时长，无需重挂音轨（避免中断）
+                self._status_label.setText("增强完成 — 已在增强音频上继续播放")
+                QTimer.singleShot(3000, lambda: self._pipeline.cleanup_old_files(
+                    keep=status.enhanced_file))
+                return
+
             # 总是切换到新结果（每个结果独立文件名，不会覆盖正在播的旧文件）
+            was_playing_other = self._enhanced_playing
             current_pos = self._player_widget.position
             self._sync.activate_enhanced(status.enhanced_file, current_pos)
             self._enhanced_playing = True
             self._update_media_info()
             self._status_label.setText(
-                "重新增强完成 — 已切换到新结果" if was_playing
+                "重新增强完成 — 已切换到新结果" if was_playing_other
                 else "增强完成 — 切换到增强音频")
             # mpv 释放旧文件句柄后清理旧代临时文件（失败会静默跳过）
             QTimer.singleShot(3000, lambda: self._pipeline.cleanup_old_files(

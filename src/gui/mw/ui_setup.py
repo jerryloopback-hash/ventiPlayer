@@ -247,6 +247,8 @@ class UiSetupMixin:
         self._enhance_busy: bool = False
         # 当前增强请求的取消事件（每次请求新建，避免旧请求线程读到新请求的状态）
         self._enhance_abort_evt = None
+        # 当前实际挂载的增强音频文件路径（渐进切换/READY 去重切换用）
+        self._active_enhanced_file: str | None = None
         # 当前正在播放的增强音频实际采用的方案标签，如 "Apollo(fp32)+FlashSR(fp16)"
         # 在 _on_enhance_requested 发起增强时捕获，避免被事后改动的勾选状态影响
         self._enhanced_scheme_label: str = ""
