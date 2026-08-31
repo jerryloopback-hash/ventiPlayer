@@ -157,7 +157,7 @@
 | 基础画面调整 | 亮度 / 对比度 / 饱和度 / Gamma，通过 mpv 属性实时调节 |
 | CAS 锐化 | AMD FidelityFX CAS shader，强度 0.0–1.0 可调，运行时模板生成 |
 | 去色带 (Deband) | mpv 内置 deband 滤镜，可调迭代 / 阈值 / 范围 |
-| 降噪 | hqdn3d 或 nlmeans 算法，强度可调 |
+| 降噪 | GPU 双边滤波着色器（Anime4K Denoise-Bilateral，Mean/Median/Mode 三算法），强度可调；GPU 实现，任意分辨率/帧率下不掉帧 |
 | HDR 色调映射 | 支持 mobius / reinhard / hable / bt.2390 / spline 等算法 + 动态峰值检测 |
 | 超分辨率 | 统一入口，下拉选择算法，启用后状态栏显示实际输出分辨率 |
 
@@ -225,7 +225,7 @@
 |---|---|
 | **音频** | 离线重跑当前启用的 Apollo / FlashSR 链（含 fp16 设置）产出增强音轨，未启用任何音频模型时直通原音；最终编码为 AAC 混流 |
 | **画面（主路径）** | **离屏 GPU 渲染真实烘焙**：用 Qt 离屏 OpenGL 上下文驱动 libmpv 的 render API（`MpvRenderContext`），让每帧走完 mpv 完整 GPU 着色器管线（Anime4K/FSR/FSRCNNX 超分、CAS 锐化、deband、HDR 色调映射、亮度/对比度/饱和度/gamma），回读 framebuffer 后用 PyAV 编码 H.264 |
-| **画面（退化回退）** | 若当前环境无法创建离屏 GPU 上下文（无显示设备等），自动退化为 PyAV 近似烘焙：亮度/对比度/饱和度/gamma（numpy）、降噪、按超分倍率做 lanczos 缩放近似；此时 GLSL 着色器无法真实烘焙，弹窗会明确告知 |
+| **画面（退化回退）** | 若当前环境无法创建离屏 GPU 上下文（无显示设备等），自动退化为 PyAV 近似烘焙：亮度/对比度/饱和度/gamma（numpy）、降噪、按超分倍率做 lanczos 缩放近似；此时 GLSL 着色器（含降噪/超分/锐化）无法真实烘焙，弹窗会明确告知 |
 | **插帧** | **不烘焙**：display-resample 伪插帧是显示期特性（依赖显示器刷新率）、小黄鸭是外部全屏叠加程序，二者均无法写进文件，导出文件保持源帧率（方案标签里标注「插帧不烘焙」）|
 
 ### 流程
@@ -361,14 +361,14 @@ mpv 嵌入组件。
 音频增强面板。两个**独立勾选框**——「编解码修复 (Apollo)」与「采样率超分 (FlashSR)」，可单独或同时勾选（同开则链式 Apollo→FlashSR）；每个模型下挂一个缩进的 **fp16 半精度**子勾选框（仅在父模型勾选时可用）；权重缺失项自动灰显。一个「修复当前音频」运行按钮触发后台离线处理，内置带播放标记的进度条。源采样率 ≥ 48 kHz 时仅禁用 FlashSR（无采样率可超分），Apollo 仍可用（伪影修复与采样率无关）。`get_settings()` 返回 `{apollo_enabled, flashsr_enabled, apollo_fp16, flashsr_fp16}`。
 
 ### `src/gui/video_enhance_panel.py`
-视频增强面板（双栏）。基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射、超分辨率（Anime4K / FSR / FSRCNNX）、视频帧生成（display-resample 伪插帧 / 小黄鸭外部全屏补帧）。FSR / CAS 用运行时模板生成 `*_active.glsl`。`get_cas_sharpness()` 返回滑块值 /10（0.0–1.0），写入 shader 前再取 `1 - x` 反转（shader 中 0 = 最强锐化）。`get_export_state()` 把当前画面增强的完整可复现状态（着色器路径列表 / mpv render 属性 / 降噪 vf / 超分倍率 / 中文方案标签）打包给视频导出模块，复用与 live-apply 同一套纯构建函数（`_build_*`），不触发任何信号。
+视频增强面板（双栏）。基础画面调整、CAS 锐化、去色带、降噪、HDR 色调映射、超分辨率（Anime4K / FSR / FSRCNNX）、视频帧生成（display-resample 伪插帧 / 小黄鸭外部全屏补帧）。FSR / CAS 用运行时模板生成 `*_active.glsl`。`get_cas_sharpness()` 返回滑块值 /10（0.0–1.0），写入 shader 前再取 `1 - x` 反转（shader 中 0 = 最强锐化）。`get_export_state()` 把当前画面增强的完整可复现状态（着色器路径列表（含 GPU 降噪）/ mpv render 属性 / 超分倍率 / 中文方案标签）打包给视频导出模块，复用与 live-apply 同一套纯构建函数（`_build_*`），不触发任何信号。
 
 ### `src/core/video_export.py`（实现拆分在 `src/core/export/` 包）
 **视频导出引擎**（后台线程，进度/完成走回调）。`VideoExporter.export()` 把视频连同音频/画面增强真实烘焙为 mp4：
 - `export/common.py`：`ExportSettings` / `ExportResult` 数据类、格式化与截止频率估算工具
 - `export/audio.py`：音频子管线——PyAV 解码整轨 → 离线重跑 Apollo/FlashSR（或直通）→ 16-bit WAV
-- `export/bake_gpu.py`：画面主路径——Qt 离屏 OpenGL 上下文 + libmpv `MpvRenderContext`，逐帧 `frame-step` → `render()` 进 FBO → `toImage()` 回读 → PyAV 编码 H.264；着色器/render 属性/降噪 vf 与 main_window 的 live-apply 对齐（**仅允许 lavfi 降噪 vf，绝不注入 vapoursynth**）
-- `export/bake_pyav.py`：GPU 上下文不可用时的退化路径——PyAV 解码 → numpy eq + nlmeans + lanczos 缩放近似，`gpu_baked=False` 并明确告知；另含 GPU/PyAV 共享的编码器工具
+- `export/bake_gpu.py`：画面主路径——Qt 离屏 OpenGL 上下文 + libmpv `MpvRenderContext`，逐帧 `frame-step` → `render()` 进 FBO → `toImage()` 回读 → PyAV 编码 H.264；着色器/render 属性与 main_window 的 live-apply 对齐（**绝不注入 vapoursynth**）
+- `export/bake_pyav.py`：GPU 上下文不可用时的退化路径——PyAV 解码 → numpy eq + lanczos 缩放近似，`gpu_baked=False` 并明确告知；另含 GPU/PyAV 共享的编码器工具
 - `export/mux.py`：混流——video-only mp4 的 H.264 流原样 remux + AAC 编码音频 → 最终 mp4
 - 对外入口 `core/video_export.py` 保留 `VideoExporter` / `ExportSettings` / `ExportResult` 及全部方法名，import 路径与拆分前一致
 

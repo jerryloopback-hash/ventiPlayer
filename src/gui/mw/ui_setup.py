@@ -313,7 +313,6 @@ class UiSetupMixin:
         self._video_enhance_panel.property_changed.connect(self._on_video_property_changed)
         self._video_enhance_panel.shader_changed.connect(self._on_video_shader_changed)
         self._video_enhance_panel.deband_changed.connect(self._on_video_deband_changed)
-        self._video_enhance_panel.vf_changed.connect(self._on_video_vf_changed)
         self._video_enhance_panel.hdr_changed.connect(self._on_video_hdr_changed)
         self._video_enhance_panel.upscale_factor_changed.connect(self._on_upscale_factor_changed)
         self._video_enhance_panel.frame_gen_changed.connect(self._on_frame_gen_changed)

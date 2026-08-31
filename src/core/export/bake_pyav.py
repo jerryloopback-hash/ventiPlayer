@@ -1,8 +1,8 @@
-"""导出画面烘焙（退化路径）：PyAV 解码 → numpy/lavfi 近似处理 → 重编码。
+"""导出画面烘焙（退化路径）：PyAV 解码 → numpy 近似处理 → 重编码。
 
 GPU 离屏渲染不可用时的回退。能烘焙：亮度/对比度/饱和度/gamma（numpy）、
-降噪（nlmeans）、按超分倍率 lanczos 缩放。不能烘焙：GLSL 着色器、deband、
-HDR tone-mapping（mpv GPU 管线特性，PyAV 无对应实现）。
+按超分倍率 lanczos 缩放。不能烘焙：GLSL 着色器（含 GPU 降噪/超分/CAS）、
+deband、HDR tone-mapping（mpv GPU 管线特性，PyAV 无对应实现）。
 """
 
 from __future__ import annotations
@@ -68,12 +68,11 @@ class VideoEncoderMixin:
 
     def _bake_video_pyav(self, video_url: str, http_headers: Optional[dict],
                          es: ExportSettings, out_path: str) -> dict:
-        """GPU 路径不可用时的退化烘焙：用 PyAV 解码 → numpy/lavfi 近似处理 → 重编码。
+        """GPU 路径不可用时的退化烘焙：用 PyAV 解码 → numpy 近似处理 → 重编码。
 
         能烘焙的：亮度/对比度/饱和度/gamma（numpy，因本机 PyAV 无 eq 滤镜）、
-        降噪（nlmeans，若选 hqdn3d 也用 nlmeans 近似——本机 PyAV 无 hqdn3d）、
-        按超分倍率做 lanczos 缩放近似。不能烘焙：GLSL 着色器(Anime4K/FSR/CAS)、deband、
-        HDR tone-mapping —— 这些是 mpv GPU 管线特性，PyAV 无对应实现，故仅缩放近似。
+        按超分倍率做 lanczos 缩放近似。不能烘焙：GLSL 着色器(降噪/Anime4K/FSR/CAS)、
+        deband、HDR tone-mapping —— 这些是 mpv GPU 管线特性，PyAV 无对应实现。
         """
         import av
 
@@ -104,7 +103,6 @@ class VideoEncoderMixin:
 
             # 预编译 numpy 系数（亮度/对比度/饱和度/gamma）
             eq = self._build_eq_coeffs(es.render_props)
-            denoise_graph = self._build_denoise_graph(es, out_w, out_h)
 
             try:
                 duration = float(vstream.duration * vstream.time_base) if vstream.duration else 0
@@ -122,9 +120,6 @@ class VideoEncoderMixin:
                 # eq（numpy）
                 if eq is not None:
                     rgb = self._apply_eq_numpy(rgb, eq)
-                # 降噪（nlmeans lavfi）
-                if denoise_graph is not None:
-                    rgb = self._apply_denoise(denoise_graph, rgb, out_w, out_h)
                 self._encode_rgb_frame(container, stream, rgb, pts)
                 pts += 1
                 if total:
@@ -197,35 +192,4 @@ class VideoEncoderMixin:
             luma = (0.299 * x[..., 0] + 0.587 * x[..., 1] + 0.114 * x[..., 2])[..., None]
             x = luma + (x - luma) * eq["saturation"]
         return (np.clip(x, 0, 1) * 255.0).astype(np.uint8)
-
-    def _build_denoise_graph(self, es: ExportSettings, w: int, h: int):
-        """构建 nlmeans 降噪 filter graph（本机 PyAV 无 hqdn3d，统一用 nlmeans 近似）。
-        未启用降噪返回 None。"""
-        if not es.denoise_mode:
-            return None
-        try:
-            import av
-            graph = av.filter.Graph()
-            src = graph.add_buffer(width=w, height=h, format="rgb24")
-            # nlmeans 强度近似：默认 s=4 与面板一致量级
-            nl = graph.add("nlmeans", "s=4:p=7:r=15")
-            sink = graph.add("buffersink")
-            src.link_to(nl)
-            nl.link_to(sink)
-            graph.configure()
-            return graph
-        except Exception as e:
-            logger.debug("构建降噪 graph 失败，跳过降噪: %s", e)
-            return None
-
-    @staticmethod
-    def _apply_denoise(graph, rgb: np.ndarray, w: int, h: int) -> np.ndarray:
-        import av
-        try:
-            f = av.VideoFrame.from_ndarray(np.ascontiguousarray(rgb), format="rgb24")
-            graph.push(f)
-            out = graph.pull()
-            return out.to_ndarray(format="rgb24")
-        except Exception:
-            return rgb
 

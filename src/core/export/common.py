@@ -102,11 +102,9 @@ class ExportSettings:
     flashsr_fp16: bool = False
 
     # 画面状态（来自 VideoEnhancePanel.get_export_state()）
-    shaders: list = field(default_factory=list)          # GLSL 着色器绝对路径列表
+    shaders: list = field(default_factory=list)          # GLSL 着色器绝对路径列表（含 GPU 降噪）
     render_props: dict = field(default_factory=dict)     # mpv render property 字典
-    vf: str = ""                                         # 降噪 vf 字符串
     upscale_factor: int = 1                              # 有效超分倍率 1/2/4
-    denoise_mode: str = ""                               # hqdn3d / nlmeans / ""
     video_scheme_label: str = "原画"                     # 中文画面方案摘要
 
     # 源信息（用于 ExportResult 里报告真实参数与截止频率估算）
@@ -132,9 +130,7 @@ class ExportSettings:
             flashsr_fp16=bool(audio_settings.get("flashsr_fp16")),
             shaders=list(export_state.get("shaders", [])),
             render_props=dict(export_state.get("render_props", {})),
-            vf=export_state.get("vf", "") or "",
             upscale_factor=int(export_state.get("upscale_factor", 1) or 1),
-            denoise_mode=export_state.get("denoise_mode", "") or "",
             video_scheme_label=export_state.get("scheme_label", "原画"),
             src_width=getattr(stream, "video_width", None),
             src_height=getattr(stream, "video_height", None),

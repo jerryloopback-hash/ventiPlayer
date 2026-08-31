@@ -1,5 +1,5 @@
 """MainWindow 增强集成 mixin：音频增强(Apollo/FlashSR)面板接线、视频增强面板
-（属性/着色器/deband/降噪 vf/HDR/超分倍率/帧生成入口）、资源监视器。
+（属性/着色器(含GPU降噪)/deband/HDR/超分倍率/帧生成入口）、资源监视器。
 
 从 main_window.py 拆出；self 即 MainWindow 实例。
 """
@@ -365,28 +365,6 @@ class EnhanceIntegrationMixin:
                     player["deband-threshold"] = params["threshold"]
                 if "range" in params:
                     player["deband-range"] = params["range"]
-        except (RuntimeError, OSError):
-            pass
-
-    @Slot(str)
-    def _on_video_vf_changed(self, vf_str: str):
-        """应用降噪 vf（hqdn3d/nlmeans）。小黄鸭是外部叠加程序、不接入 mpv vf 链，
-        故降噪独占 mpv vf 链（二者可同时开启）。
-
-        hqdn3d/nlmeans 是 lavfi(CPU) 滤镜，需要 CPU 可读帧；硬解 d3d11 帧喂不进去会被
-        mpv 禁用（日志 'Impossible to convert ... d3d11'）。故启用降噪时切 auto-copy，
-        关闭时恢复 auto-safe。
-        """
-        player = self._player_widget._player
-        if not player:
-            return
-        try:
-            if vf_str:
-                self._player_widget.set_hwdec_for_vf(True)  # 降噪需 CPU 可读帧
-                player.command("vf", "set", vf_str)
-            else:
-                player.command("vf", "set", "")
-                self._player_widget.set_hwdec_for_vf(False)  # 无 CPU 滤镜，恢复零拷贝
         except (RuntimeError, OSError):
             pass
 

@@ -13,6 +13,7 @@ _CAS_TEMPLATE = SHADERS_DIR / "CAS.glsl"
 _CAS_GENERATED = SHADERS_DIR / "CAS_active.glsl"
 _FSR_TEMPLATE = SHADERS_DIR / "FSR.glsl"
 _FSR_GENERATED = SHADERS_DIR / "FSR_active.glsl"
+_DENOISE_GENERATED = SHADERS_DIR / "Denoise_active.glsl"
 
 # Anime4K v4.x preset system
 # Modes: A/B/C/A+A/B+B/C+A (content-type optimized)
@@ -79,6 +80,15 @@ _HDR_TONE_MAPPING_ALGORITHMS = [
     "auto", "bt.2390", "spline", "mobius", "reinhard", "hable", "clip",
 ]
 
+# 降噪：GPU 双边滤波着色器（Anime4K v3.2 Denoise-Bilateral 系列）。
+# 旧实现（CPU lavfi hqdn3d/nlmeans）已移除：hqdn3d 在 4K60 实测掉帧严重
+# （逐像素 CPU 滤镜 ~36fps@4K），nlmeans 约 1-2s/帧且阻塞主线程（UI 未响应）。
+_DENOISE_TEMPLATES = {
+    "Mean (最快)": "Anime4K_Denoise_Bilateral_Mean.glsl",
+    "Median (均衡)": "Anime4K_Denoise_Bilateral_Median.glsl",
+    "Mode (边缘保持)": "Anime4K_Denoise_Bilateral_Mode.glsl",
+}
+
 _TSCALE_DESC = {
     "oversample": "最近邻，无混合，保持锐利",
     "triangle": "线性混合，锐利但有轻微重影",
@@ -95,7 +105,6 @@ class VideoEnhancePanel(QWidget):
     property_changed = Signal(str, object)
     shader_changed = Signal(list)
     deband_changed = Signal(bool, dict)
-    vf_changed = Signal(str)
     hdr_changed = Signal(bool, dict)
     upscale_factor_changed = Signal(int)  # 1 = off, 2 = x2, 4 = x4
     frame_gen_changed = Signal(bool, dict)  # (enabled, {backend, tscale, threshold})
@@ -237,8 +246,8 @@ class VideoEnhancePanel(QWidget):
         left_col.addWidget(self._deband_widget)
         self._deband_widget.setEnabled(False)
 
-        # --- Denoise ---
-        self._enable_denoise = QCheckBox("降噪")
+        # --- Denoise (GPU 双边滤波着色器) ---
+        self._enable_denoise = QCheckBox("降噪 (GPU)")
         self._enable_denoise.toggled.connect(self._on_denoise_toggled)
         left_col.addWidget(self._enable_denoise)
 
@@ -250,8 +259,8 @@ class VideoEnhancePanel(QWidget):
         row_mode = QHBoxLayout()
         row_mode.addWidget(QLabel("算法:"))
         self._denoise_mode = QComboBox()
-        self._denoise_mode.addItems(["hqdn3d", "nlmeans"])
-        self._denoise_mode.currentIndexChanged.connect(self._emit_vf)
+        self._denoise_mode.addItems(list(_DENOISE_TEMPLATES.keys()))
+        self._denoise_mode.currentIndexChanged.connect(self._on_denoise_params_changed)
         row_mode.addWidget(self._denoise_mode)
         row_mode.addStretch()
         denoise_layout.addLayout(row_mode)
@@ -263,9 +272,7 @@ class VideoEnhancePanel(QWidget):
         self._denoise_strength.setValue(4)
         self._denoise_strength_val = QLabel("4")
         self._denoise_strength_val.setFixedWidth(20)
-        self._denoise_strength.valueChanged.connect(
-            lambda v: (self._denoise_strength_val.setText(str(v)), self._emit_vf())
-        )
+        self._denoise_strength.valueChanged.connect(self._on_denoise_params_changed)
         row_strength.addWidget(self._denoise_strength, 1)
         row_strength.addWidget(self._denoise_strength_val)
         denoise_layout.addLayout(row_strength)
@@ -553,8 +560,12 @@ class VideoEnhancePanel(QWidget):
 
     def _on_denoise_toggled(self, checked: bool):
         self._denoise_widget.setEnabled(checked)
-        # 降噪与小黄鸭可同时开启（小黄鸭是外部叠加程序，不占用 mpv vf 链）。
-        self._emit_vf()
+        # 降噪是 GPU 着色器，走着色器链（旧 CPU vf 路径已移除）
+        self._emit_all_shaders()
+
+    def _on_denoise_params_changed(self, *_args):
+        if self._enable_denoise.isChecked():
+            self._emit_all_shaders()
 
     def _on_hdr_toggled(self, checked: bool):
         self._hdr_widget.setEnabled(checked)
@@ -666,11 +677,16 @@ class VideoEnhancePanel(QWidget):
         self.frame_gen_changed.emit(enabled, params)
 
     def _build_shader_list(self) -> list[str]:
-        """构建 CAS + 超分着色器的完整路径列表（不发信号）。
+        """构建 降噪 + CAS + 超分着色器的完整路径列表（不发信号）。
 
         从 _emit_all_shaders 中抽出，便于导出模块离线复用同一条着色器链。
+        降噪放最前：先在源分辨率上少处理像素，再进超分。
         """
         shaders = []
+        if self._enable_denoise.isChecked():
+            denoise_path = self._generate_denoise_shader()
+            if denoise_path:
+                shaders.append(denoise_path)
         if self._enable_sharpen.isChecked():
             cas_path = self._generate_cas_shader()
             if cas_path:
@@ -811,19 +827,29 @@ class VideoEnhancePanel(QWidget):
         enabled = self._enable_deband.isChecked()
         self.deband_changed.emit(enabled, self._build_deband_params())
 
-    def _build_vf_string(self) -> str:
-        """构建降噪 vf 字符串（不发信号）。未启用降噪时返回空串。"""
-        if not self._enable_denoise.isChecked():
-            return ""
-        mode = self._denoise_mode.currentText()
-        strength = self._denoise_strength.value()
-        if mode == "hqdn3d":
-            return f"lavfi=[hqdn3d={strength}:{strength - 1}:{strength + 2}:{strength}]"
-        return f"lavfi=[nlmeans=s={strength}:p=7:r=15]"
+    def _get_denoise_intensity_sigma(self) -> float:
+        """降噪强度滑条(1-10) → INTENSITY_SIGMA (0.03-0.30，越高越强)。"""
+        return round(self._denoise_strength.value() / 10.0 * 0.3, 2)
 
-    def _emit_vf(self, *_args):
-        """Emit vf filter string for denoise."""
-        self.vf_changed.emit(self._build_vf_string())
+    def _generate_denoise_shader(self) -> str | None:
+        """按算法/强度生成 GPU 双边滤波降噪着色器，返回生成文件路径。"""
+        algo = self._denoise_mode.currentText()
+        template = SHADERS_DIR / _DENOISE_TEMPLATES.get(algo, "")
+        if not template.exists():
+            return None
+        source = template.read_text(encoding="utf-8")
+        source = source.replace(
+            "#define INTENSITY_SIGMA 0.1",
+            f"#define INTENSITY_SIGMA {self._get_denoise_intensity_sigma():.2f}",
+        )
+        _DENOISE_GENERATED.write_text(source, encoding="utf-8")
+        return str(_DENOISE_GENERATED)
+
+    def get_denoise_algo_label(self) -> str:
+        """降噪算法短名（'Median (均衡)' → '双边Median'），用于方案标签。"""
+        algo = self._denoise_mode.currentText()
+        short = algo.split(" ")[0] if algo else ""
+        return f"双边{short}"
 
     def _build_hdr_params(self) -> dict:
         """构建 HDR 色调映射参数字典（不发信号）。"""
@@ -869,7 +895,6 @@ class VideoEnhancePanel(QWidget):
         self._refresh_dep_hint()
         self.shader_changed.emit([])
         self.deband_changed.emit(False, {})
-        self.vf_changed.emit("")
         self.hdr_changed.emit(False, {})
         self.upscale_factor_changed.emit(1)
         self.frame_gen_changed.emit(False, {})
@@ -919,7 +944,7 @@ class VideoEnhancePanel(QWidget):
 
     def _build_scheme_label(self) -> str:
         """生成中文画面方案摘要，如
-        '超分Anime4K x4 + 锐化 + 去色带 + 降噪hqdn3d + HDR'。未启用任何画面增强时返回 '原画'。
+        '超分Anime4K x4 + 锐化 + 去色带 + 降噪双边Median + HDR'。未启用任何画面增强时返回 '原画'。
         注意：插帧(display-resample 伪插帧)是显示期属性、无法烘焙进文件，故方案标签里
         显式标注「插帧不烘焙」。
         """
@@ -938,7 +963,7 @@ class VideoEnhancePanel(QWidget):
         if self._enable_basic.isChecked():
             parts.append("基础调整")
         if self._enable_denoise.isChecked():
-            parts.append(f"降噪{self._denoise_mode.currentText()}")
+            parts.append(f"降噪{self.get_denoise_algo_label()}")
         if self._enable_hdr.isChecked():
             parts.append("HDR")
         label = " + ".join(parts) if parts else "原画"
@@ -950,27 +975,19 @@ class VideoEnhancePanel(QWidget):
         """返回离线复现当前画面所需的完整状态，供 video_export.VideoExporter 使用。
 
         返回字段：
-            shaders:        list[str]  CAS+超分着色器绝对路径列表
+            shaders:        list[str]  降噪/CAS+超分着色器绝对路径列表（降噪也在其中）
             render_props:   dict       要写给 mpv 的 render property（亮度/对比度/饱和度/
                                        gamma/deband*/tone-mapping/hdr-compute-peak）
-            vf:             str        降噪 vf 字符串（hqdn3d/nlmeans），未启用为 ""
             upscale_factor: int        有效超分倍率(1/2/4)，未启用超分为 1
-            denoise_mode:   str        当前降噪算法名（hqdn3d/nlmeans），未启用为 ""
             scheme_label:   str        中文画面方案摘要（含「插帧不烘焙」标注）
         """
         upscale_factor = (
             self._get_current_upscale_factor()
             if self._enable_upscale.isChecked() else 1
         )
-        denoise_mode = (
-            self._denoise_mode.currentText()
-            if self._enable_denoise.isChecked() else ""
-        )
         return {
             "shaders": self._build_shader_list(),
             "render_props": self._build_render_properties(),
-            "vf": self._build_vf_string(),
             "upscale_factor": upscale_factor,
-            "denoise_mode": denoise_mode,
             "scheme_label": self._build_scheme_label(),
         }

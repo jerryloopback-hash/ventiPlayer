@@ -4,7 +4,7 @@
 - 驱动 libmpv 的 render API (mpv.MpvRenderContext)，配合 Qt 的离屏 OpenGL 上下文，
   让每一帧走完 mpv 的完整 GPU 着色器管线（Anime4K/FSR/FSRCNNX 超分、CAS 锐化、
   deband、HDR tone-mapping、亮度/对比度/饱和度/gamma），回读 framebuffer 后编码。
-- 安全约束：绝不 import vapoursynth / vsrife；离屏 mpv 实例只用 lavfi 降噪 vf。
+- 安全约束：绝不 import vapoursynth / vsrife。
 - 失败（无显示设备等）会抛出，由调用方退化到 bake_pyav。
 """
 
@@ -102,7 +102,7 @@ class GpuBakeMixin:
             frame_ready = threading.Event()
             render_ctx.update_cb = lambda: frame_ready.set()
 
-            # 5) 应用画面增强（着色器/deband/render props/降噪 vf）
+            # 5) 应用画面增强（着色器(含GPU降噪)/deband/render props）
             self._apply_video_enhancements(player, es)
 
             # 6) 加载文件
@@ -175,7 +175,8 @@ class GpuBakeMixin:
     def _apply_video_enhancements(self, player, es: ExportSettings):
         """把 get_export_state 捕获的画面增强套到离屏 mpv，对齐 main_window 的 live-apply。
 
-        安全：vf 仅允许 lavfi 的 hqdn3d/nlmeans 降噪；绝不注入 vapoursynth vf。"""
+        降噪是 GPU 双边滤波着色器，随 shaders 列表一起挂载（旧 lavfi vf 路径已移除）；
+        绝不注入 vapoursynth。"""
         import sys as _sys
         # render props：brightness/contrast/saturation/gamma/deband*/tone-mapping/...
         for k, v in (es.render_props or {}).items():
@@ -183,7 +184,7 @@ class GpuBakeMixin:
                 player[k] = v
             except Exception as e:
                 logger.debug("set render prop %s=%s 失败: %s", k, v, e)
-        # GLSL 着色器链
+        # GLSL 着色器链（降噪 + CAS + 超分）
         try:
             shaders = [p for p in (es.shaders or []) if Path(p).is_file()]
             if shaders:
@@ -193,15 +194,6 @@ class GpuBakeMixin:
                 player.command("change-list", "glsl-shaders", "clr", "")
         except Exception as e:
             logger.debug("应用着色器失败: %s", e)
-        # 降噪 vf（仅 lavfi，安全）
-        try:
-            vf = es.vf or ""
-            if vf and "vapoursynth" not in vf.lower():
-                player.command("vf", "set", vf)
-            else:
-                player.command("vf", "set", "")
-        except Exception as e:
-            logger.debug("应用 vf 失败: %s", e)
 
     def _wait_video_ready(self, player, timeout: float = 30.0):
         """等待文件加载、video 参数就绪。"""

@@ -45,17 +45,14 @@ class TestExportSettings(unittest.TestCase):
         export_state = {
             "shaders": ["/a/Anime4K_Upscale_CNN_x2_M.glsl"],
             "render_props": {"brightness": 10, "deband": "yes"},
-            "vf": "lavfi=[hqdn3d=4:3:6:4]",
             "upscale_factor": 4,
-            "denoise_mode": "hqdn3d",
-            "scheme_label": "超分Anime4K x4 + 降噪hqdn3d",
+            "scheme_label": "超分Anime4K x4 + 降噪双边Median",
         }
         es = ExportSettings.from_states("/out/v.mp4", audio, export_state, _FakeStream())
         self.assertEqual(es.output_path, "/out/v.mp4")
         self.assertTrue(es.apollo_enabled)
         self.assertTrue(es.flashsr_fp16)
         self.assertEqual(es.upscale_factor, 4)
-        self.assertEqual(es.denoise_mode, "hqdn3d")
         self.assertEqual(es.shaders, ["/a/Anime4K_Upscale_CNN_x2_M.glsl"])
         self.assertEqual(es.render_props["deband"], "yes")
         self.assertEqual(es.src_width, 1920)
@@ -164,17 +161,16 @@ class TestPanelExportState(unittest.TestCase):
     def test_default_state_keys(self):
         panel = self._panel()
         state = panel.get_export_state()
-        for key in ("shaders", "render_props", "vf", "upscale_factor",
-                    "denoise_mode", "scheme_label"):
+        for key in ("shaders", "render_props", "upscale_factor",
+                    "scheme_label"):
             self.assertIn(key, state)
         self.assertIsInstance(state["shaders"], list)
         self.assertIsInstance(state["render_props"], dict)
-        self.assertIsInstance(state["vf"], str)
         self.assertIsInstance(state["scheme_label"], str)
         # 默认啥都没开 → 原画，倍率 1
         self.assertEqual(state["upscale_factor"], 1)
         self.assertEqual(state["scheme_label"], "原画")
-        self.assertEqual(state["vf"], "")
+        self.assertEqual(state["shaders"], [])
 
     def test_enabled_features_reflected(self):
         panel = self._panel()
@@ -193,23 +189,40 @@ class TestPanelExportState(unittest.TestCase):
         state = panel.get_export_state()
         # 倍率为 4
         self.assertEqual(state["upscale_factor"], 4)
-        # 着色器非空
+        # 着色器非空，且降噪着色器在链首、超分在其中
         self.assertTrue(len(state["shaders"]) > 0)
+        self.assertTrue(state["shaders"][0].endswith("Denoise_active.glsl"))
+        self.assertTrue(any("Anime4K_Upscale" in p for p in state["shaders"]))
+        self.assertTrue(all(os.path.isfile(p) for p in state["shaders"]))
         # render props 含基础调整 + deband + tone-mapping
         rp = state["render_props"]
         self.assertIn("brightness", rp)
         self.assertEqual(rp.get("deband"), "yes")
         self.assertIn("tone-mapping", rp)
-        # vf 为 nlmeans 或 hqdn3d
-        self.assertTrue(state["vf"].startswith("lavfi="))
-        # 降噪模式
-        self.assertIn(state["denoise_mode"], ("hqdn3d", "nlmeans"))
         # scheme_label 含关键中文词
         label = state["scheme_label"]
         self.assertIn("超分Anime4K", label)
         self.assertIn("锐化", label)
         self.assertIn("去色带", label)
         self.assertIn("HDR", label)
+        self.assertIn("降噪双边", label)
+
+    def test_denoise_shader_strength_mapping(self):
+        """降噪强度滑条映射到生成着色器的 INTENSITY_SIGMA。"""
+        import re
+        panel = self._panel()
+        panel._enable_denoise.setChecked(True)
+        panel._denoise_mode.setCurrentIndex(1)  # Median
+        path = panel.get_export_state()["shaders"][0]
+        self.assertTrue(path.endswith("Denoise_active.glsl"))
+        src = open(path, encoding="utf-8").read()
+        m = re.search(r"#define INTENSITY_SIGMA ([\d.]+)", src)
+        # 默认强度 4 → 0.12
+        self.assertEqual(m.group(1), "0.12")
+        panel._denoise_strength.setValue(10)
+        src = open(panel._build_shader_list()[0], encoding="utf-8").read()
+        m = re.search(r"#define INTENSITY_SIGMA ([\d.]+)", src)
+        self.assertEqual(m.group(1), "0.30")
 
     def test_frame_gen_not_baked_note(self):
         panel = self._panel()
