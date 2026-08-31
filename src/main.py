@@ -93,6 +93,13 @@ os.makedirs(_miopen_cache, exist_ok=True)
 os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 os.environ.setdefault("MIOPEN_LOG_LEVEL", "2")
 
+# 禁用 hipBLASLt 的 addmm/matmul 路径（回落经典 BLAS）。
+# 根因实锤（log/ventiplayer.log + tools/repro_warmup.py 复现）：RX 9070
+# (gfx1201) + Windows ROCm 上，模型上卡的首个 hipBLASLt matmul 会触发
+# "LLVM ERROR: Can't get available size" 原生 abort（Python 拦不住，进程
+# 直接死 → 增强加载阶段偶发闪退）。禁用后加载+推理稳定（fp16 亦然）。
+os.environ["DISABLE_ADDMM_CUDA_LT"] = "1"
+
 # PyTorch memory management for 16GB VRAM
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "garbage_collection_threshold:0.6,max_split_size_mb:128")
