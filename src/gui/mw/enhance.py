@@ -297,6 +297,10 @@ class EnhanceIntegrationMixin:
                 if shader_paths:
                     sep = ";" if sys.platform == "win32" else ":"
                     shader_str = sep.join(shader_paths)
+                    # 必须先 clr 再 set：mpv 对"同路径 set"是无操作（不重读文件，
+                    # 已在真实 libmpv 上实测确认），而 CAS/FSR 的生成文件内容会随
+                    # 参数实时改写，不先清掉就无法把新强度应用到已挂载的着色器。
+                    player.command("change-list", "glsl-shaders", "clr", "")
                     player.command("change-list", "glsl-shaders", "set", shader_str)
                 else:
                     player.command("change-list", "glsl-shaders", "clr", "")
