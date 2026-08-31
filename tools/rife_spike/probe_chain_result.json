@@ -1,0 +1,14 @@
+{
+ "host_attr": 12345,
+ "torch_cuda": true,
+ "fmt_id": 805830913,
+ "fmt_name": "YUV420P8",
+ "fps": "0/1",
+ "num_frames": 134217727,
+ "src_w": 640,
+ "src_h": 360,
+ "rgb_fmt": "RGBS",
+ "pair_w": 1280,
+ "out_fps": "assumed 48/1",
+ "chain_ok": true
+}
