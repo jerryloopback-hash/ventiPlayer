@@ -37,6 +37,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _VPY_TEMPLATE = Template('''\
 # VentiPlayer RIFE 真插帧 —— 由 src/core/rife_service.py 生成，勿手改
 # 配置: model=$MODEL fp16=$FP16 mode=$MODE scale=$SCALE out_fps=$FPS_NUM/$FPS_DEN
+# YUV 域处理链（v2）: 帧平面直读 → GPU 上 YUV↔RGB（矩阵/范围按帧 props 动态）
+# → RIFE 推理 → 写回。不经 VS RGBS 浮点转换: PCIe 流量 ~80MB→~8MB/帧，
+# CPU zimg resize 全部消除（音画同步修复的关键，Phase 1.5）。
 import sys
 _REPO = "$REPO"
 if _REPO not in sys.path:
@@ -64,16 +67,19 @@ TS = torch.tensor([0.5], device="cuda", dtype=DT)
 core = vs.core
 src = video_in
 H, W = src.height, src.width
-if src.format.color_family == vs.RGB:
-    rgb = src.resize.Bicubic(format=vs.RGBS)
-else:
-    # init 期不可 get_frame(0) 读 _Matrix（mpv 会回黑帧警告），HD 源统一按 709
-    rgb = src.resize.Bicubic(format=vs.RGBS, matrix_in_s="709")
+FMT = src.format
+if FMT.color_family != vs.YUV or FMT.subsampling_w != 1 or FMT.subsampling_h != 1:
+    raise RuntimeError("RIFE: unsupported format " + FMT.name)
+IS_NV12 = FMT.name == "NV12"
+B = FMT.bits_per_sample
+MAXV = float((1 << B) - 1)
+_DTYPE = torch.uint8 if B <= 8 else torch.uint16
+_CTYPE = ctypes.c_uint8 if B <= 8 else ctypes.c_uint16
 
-# 帧对: pair[i] = [F_i | F_i+1]。mpv 源 num_frames 为哨兵值，不做长度修补；
-# 尾帧对的 F_i+1 请求自然落 EOF，不缺帧不崩溃（probe_vpy_chain 验证）。
-shifted = rgb.std.Trim(first=1)
-pair = core.std.StackHorizontal(clips=[rgb, shifted])
+# 帧对: pair[i] = [F_i | F_i+1]（YUV 域水平拼接，420 子采样比例保持）。
+# mpv 源 num_frames 为哨兵值不做长度修补；尾帧对的 F_i+1 请求自然落 EOF。
+shifted = src.std.Trim(first=1)
+pair = core.std.StackHorizontal(clips=[src, shifted])
 
 PAD = 128
 if MODE == "down":
@@ -84,25 +90,9 @@ else:
 PH = (PAD - DH % PAD) % PAD
 PW = (PAD - DW % PAD) % PAD
 
-def _half(f, x0, x1):
-    """读帧三平面列区间 [x0:x1] → (3, h, w) cpu tensor（含 stride 处理）。
-
-    用 strided view 直入 torch（无 numpy 拷贝），由 .cuda() 一次性打包上传。
-    """
-    h, w = f.height, x1 - x0
-    planes = []
-    for p in range(3):
-        stride = f.get_stride(p) // 4
-        ptr = ctypes.cast(f.get_read_ptr(p), ctypes.POINTER(ctypes.c_float))
-        row = np.ctypeslib.as_array(ptr, shape=(h, stride))
-        planes.append(torch.from_numpy(row[:, x0:x1]))
-    return torch.stack(planes)
-
 # ---- 单一专用推理线程 ----
-# torch/MIOpen handle 是 per-thread 的（实测新线程首推 ~700ms），VS 默认开
-# CPU 核数个工作线程轮流评估回调 → 每线程首帧触发 handle 初始化，表现为
-# 播放长期卡顿（实测 1080p down0.5 仅 6.4 pairs/s vs 基准 137fps）。
-# 收拢到单 worker 线程后 handle 终生复用（实测 9ms/对，111 pairs/s）。
+# torch/MIOpen handle 是 per-thread 的（实测新线程首推 ~700ms），VS 多工作线程
+# 轮流评估回调会持续触发初始化 → 卡顿。收拢单线程后 handle 终生复用。
 import threading as _th
 import queue as _q
 
@@ -127,45 +117,123 @@ def _submit_infer(a, b):
     _infer_q.put(box)
     return box
 
-# 求值期预热 worker 的 MIOpen handle（首个推理的 per-thread 初始化提前到
-# 挂 vf 之前完成，首帧回调零冲击；kernel 已由宿主 prime 落盘缓存）
+# 求值期预热 worker 的 MIOpen handle（kernel 已由宿主 prime 落盘缓存）
 _warm = torch.zeros(1, 3, DH + PH, DW + PW, device="cuda", dtype=DT)
 _box = _submit_infer(_warm, _warm)
 _box["ev"].wait()
 del _warm, _box
 
+# ---- YUV <-> RGB（BT.709/601/2020 + limited/full，逐帧 props 动态） ----
+_MTX = {1: (0.2126, 0.7152, 0.0722), 5: (0.299, 0.587, 0.114),
+        6: (0.299, 0.587, 0.114), 9: (0.2627, 0.6780, 0.0593)}
+
+def _ranges(full):
+    if full:
+        return 0.0, 1.0, 0.5, 1.0
+    if B <= 8:
+        return 16.0 / 255, 219.0 / 255, 128.0 / 255, 224.0 / 255
+    return 64.0 / MAXV, 876.0 / MAXV, 512.0 / MAXV, 896.0 / MAXV
+
+def _up2(t):
+    """420→444 精确相位 2x 双线性: 偶数位置=样本值, 奇数位置=邻均值。
+    与下采样取偶数位置互逆（整条 YUV→RGB→YUV 往返零误差，勿改用
+    F.interpolate——其 align_corners 两种语义都不是 420 相位）。"""
+    tp = F.pad(t[None, None], (0, 0, 0, 1), mode="replicate")[0, 0]
+    rows = torch.empty(t.shape[0] * 2, t.shape[1], device=t.device, dtype=t.dtype)
+    rows[0::2] = t
+    rows[1::2] = (tp[:-1] + tp[1:]) / 2
+    tp2 = F.pad(rows[None, None], (0, 1, 0, 0), mode="replicate")[0, 0]
+    cols = torch.empty(rows.shape[0], t.shape[1] * 2, device=t.device, dtype=t.dtype)
+    cols[:, 0::2] = rows
+    cols[:, 1::2] = (tp2[:, :-1] + tp2[:, 1:]) / 2
+    return cols
+
+def _plane(f, p, sh, sw, x0, x1):
+    stride = f.get_stride(p)
+    el = 1 if B <= 8 else 2
+    ptr = ctypes.cast(f.get_read_ptr(p), ctypes.POINTER(_CTYPE))
+    row = np.ctypeslib.as_array(ptr, shape=(sh, stride // el))
+    return torch.from_numpy(row[:, x0:x1]).cuda()
+
+def _prop_int(props, key):
+    v = props.get(key)
+    if isinstance(v, list):
+        v = v[0] if v else None
+    return v
+
 def rife_cb(n, f):
     # VS/mpv 日志通道会截断深层 traceback，回调异常必须自行落盘才能定位根因
     try:
-        t0 = _half(f, 0, f.width // 2).cuda().to(DT)
-        t1 = _half(f, f.width // 2, f.width).cuda().to(DT)
-        if MODE == "down":
-            a = F.interpolate(t0[None], size=(DH, DW), mode="bilinear",
-                              align_corners=False)
-            b = F.interpolate(t1[None], size=(DH, DW), mode="bilinear",
-                              align_corners=False)
-            a = F.pad(a, (0, PW, 0, PH))
-            b = F.pad(b, (0, PW, 0, PH))
-            box = _submit_infer(a, b)
-            box["ev"].wait()
-            if "e" in box:
-                raise box["e"]
-            out = box["r"]
-            out = out[:, :, :DH, :DW]
-            out = F.interpolate(out.float(), size=(H, W), mode="bilinear",
-                                align_corners=False)[0]
+        props = f.props
+        mtx = _MTX.get(_prop_int(props, "_Matrix") or 1, _MTX[1])
+        full = _prop_int(props, "_ColorRange") == 1
+        y_off, y_span, c_mid, c_span = _ranges(full)
+        kr, kg, kb = mtx
+        c_r, c_b = 2 * (1 - kb), 2 * (1 - kr)
+
+        if IS_NV12:
+            y_full = _plane(f, 0, H, 2 * W, 0, 2 * W)
+            c_full = _plane(f, 1, H // 2, 2 * W, 0, 2 * W)
+            halves = []
+            for sl in (slice(0, W), slice(W, 2 * W)):
+                uv = c_full[:, sl].reshape(H // 2, W // 2, 2)
+                halves.append((y_full[:, sl], uv[:, :, 0], uv[:, :, 1]))
         else:
-            a = F.pad(t0[None], (0, PW, 0, PH))
-            b = F.pad(t1[None], (0, PW, 0, PH))
+            y_full = _plane(f, 0, H, 2 * W, 0, 2 * W)
+            u_full = _plane(f, 1, H // 2, W, 0, W)
+            v_full = _plane(f, 2, H // 2, W, 0, W)
+            halves = [(y_full[:, :W], u_full[:, :W // 2], v_full[:, :W // 2]),
+                      (y_full[:, W:], u_full[:, W // 2:], v_full[:, W // 2:])]
+
+        def _to_rgb(t3):
+            y, u, v = t3
+            y01 = (y.float() / MAXV - y_off) / y_span
+            u01 = (u.float() / MAXV - c_mid) / c_span
+            v01 = (v.float() / MAXV - c_mid) / c_span
+            u_up = _up2(u01)
+            v_up = _up2(v01)
+            r = y01 + c_r * v_up
+            b = y01 + c_b * u_up
+            g = (y01 - kr * r - kb * b) / kg
+            return torch.stack([r, g, b])[None]
+
+        rgb0 = _to_rgb(halves[0]).to(DT)
+        rgb1 = _to_rgb(halves[1]).to(DT)
+        if MODE == "down":
+            a = F.pad(F.interpolate(rgb0, size=(DH, DW), mode="bilinear",
+                                    align_corners=False), (0, PW, 0, PH))
+            b = F.pad(F.interpolate(rgb1, size=(DH, DW), mode="bilinear",
+                                    align_corners=False), (0, PW, 0, PH))
             box = _submit_infer(a, b)
             box["ev"].wait()
             if "e" in box:
                 raise box["e"]
-            out = box["r"]
-            out = out[0, :, :H, :W].float()
-        mid = out.clamp_(0.0, 1.0).cpu().numpy()
+            o = box["r"][:, :, :DH, :DW]
+            o = F.interpolate(o.float(), size=(H, W), mode="bilinear",
+                              align_corners=False)[0]
+        else:
+            a = F.pad(rgb0, (0, PW, 0, PH))
+            b = F.pad(rgb1, (0, PW, 0, PH))
+            box = _submit_infer(a, b)
+            box["ev"].wait()
+            if "e" in box:
+                raise box["e"]
+            o = box["r"][0, :, :H, :W].float()
+
+        o = o.clamp_(0.0, 1.0)
+        r, g, b = o[0], o[1], o[2]
+        y2 = kr * r + kg * g + kb * b
+        cb = (b - y2) / c_b
+        cr = (r - y2) / c_r
+        # 三平面拼成一次 D2H（每 .cpu() 一次同步 ~5ms，三次 14ms 是主要开销）
+        flat = torch.cat([((y2 * y_span + y_off) * MAXV).round().to(_DTYPE).reshape(-1),
+                          ((cb[::2, ::2] * c_span + c_mid) * MAXV).round().to(_DTYPE).reshape(-1),
+                          ((cr[::2, ::2] * c_span + c_mid) * MAXV).round().to(_DTYPE).reshape(-1)])
+        all_np = flat.cpu().numpy()
+        y_np = all_np[:H * W].reshape(H, W)
+        u_np = all_np[H * W:H * W + (H // 2) * (W // 2)].reshape(H // 2, W // 2)
+        v_np = all_np[H * W + (H // 2) * (W // 2):].reshape(H // 2, W // 2)
     except BaseException:
-        # VS/mpv 日志通道截断深层 traceback，异常必须自行落盘/打 stderr 才能定位
         try:
             import traceback as _tb
             _msg = _tb.format_exc()
@@ -182,22 +250,34 @@ def rife_cb(n, f):
             pass
         raise
     nf = f.copy()
-    for p in range(3):
-        stride = nf.get_stride(p) // 4
-        ptr = ctypes.cast(nf.get_write_ptr(p), ctypes.POINTER(ctypes.c_float))
-        dst = np.ctypeslib.as_array(ptr, shape=(H, stride))
-        dst[:, :W] = mid[p]
+    el = 1 if B <= 8 else 2
+
+    def _wr(p, sh, sw, x0, arr):
+        stride = nf.get_stride(p)
+        ptr = ctypes.cast(nf.get_write_ptr(p), ctypes.POINTER(_CTYPE))
+        dst = np.ctypeslib.as_array(ptr, shape=(sh, stride // el))
+        dst[:, x0:x0 + sw] = arr
+
+    _wr(0, H, W, 0, y_np)
+    if IS_NV12:
+        chroma = np.empty((H // 2, W), dtype=np.uint8 if B <= 8 else np.uint16)
+        chroma[:, 0::2] = u_np
+        chroma[:, 1::2] = v_np
+        _wr(1, H // 2, W, 0, chroma)
+    else:
+        _wr(1, H // 2, W // 2, 0, u_np)
+        _wr(2, H // 2, W // 2, 0, v_np)
     return nf
 
 mid2w = pair.std.ModifyFrame(pair, rife_cb)
 mid = mid2w.std.Crop(right=W)
-out = core.std.Interleave(clips=[rgb, mid])
+out = core.std.Interleave(clips=[src, mid])
 out = core.std.AssumeFPS(out, fpsnum=FPS_NUM * 2, fpsden=FPS_DEN)
-BITS = src.format.bits_per_sample
-out = out.resize.Bicubic(format=vs.YUV420P8 if BITS <= 8 else vs.YUV420P10,
-                         matrix_s="709")
 out.set_output()
 ''')
+
+
+
 
 
 def fps_to_fraction(src_fps: float) -> tuple[int, int]:

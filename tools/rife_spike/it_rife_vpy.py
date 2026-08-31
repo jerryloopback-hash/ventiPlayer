@@ -41,6 +41,8 @@ _ap.add_argument("--video", default=str(SPIKE / "test_360p24.mp4"))
 _ap.add_argument("--model", default="v4_25_lite")
 _ap.add_argument("--scale", type=float, default=0.75)
 _ap.add_argument("--min-fps", type=float, default=40)
+_ap.add_argument("--throughput", action="store_true")
+_ap.add_argument("--hwdec", default="no")
 _args = _ap.parse_args()
 svc = RifeFrameGenService(config_dir=Path.home() / ".ventiplayer")
 vpy = svc.write_vpy(_args.model, _args.scale, 24.0)
@@ -61,7 +63,8 @@ print(f"[it] prime2 {time.perf_counter()-t0:.1f}s", flush=True)
 
 import mpv  # noqa: E402
 errors = []
-player = mpv.MPV(vo="null", hwdec="no", idle="yes", keep_open="yes",
+player = mpv.MPV(vo="null", hwdec=_args.hwdec, idle="yes", keep_open="yes",
+                 **({"untimed": "yes"} if _args.throughput else {}),
                  log_handler=lambda l, c, m: errors.append((l, c, m))
                  if l in ("error", "fatal") else None,
                  loglevel="warn")
@@ -89,11 +92,40 @@ print(f"[it] estimated_vf_fps={vf_fps}", flush=True)
 print(f"[it] errors={len(errors)}", flush=True)
 for e in errors[:12]:
     print("   E", str(e), flush=True)
+if _args.throughput:
+    # 实时速率测量（无 untimed）：Δpos/Δwall ≈ 1.0 → 跟得上实时（音画同步）；
+    # <1 → 视频落后于音频时钟。这是用户实际体验的直接指标。
+    samples = []
+    t0 = time.time()
+    while time.time() - t0 < 90:
+        try:
+            pt = player.time_pos
+        except Exception:
+            pt = None
+        if pt is not None and pt > 0:
+            samples.append((time.time(), pt))
+            if pt >= 9.5:
+                break
+        time.sleep(0.05)
+    rate = None
+    lo = hi = None
+    for (ta, pa) in samples:
+        if pa >= 1.0 and lo is None:
+            lo = (ta, pa)
+        if pa >= 9.0:
+            hi = (ta, pa)
+    if lo and hi and hi[0] > lo[0]:
+        rate = (hi[1] - lo[1]) / (hi[0] - lo[0])
+        print(f"[it] REALTIME_RATE: {rate:.3f} (1.0=完全跟上; >{rate*24:.1f} 对/s)", flush=True)
+    else:
+        print(f"[it] REALTIME_RATE: 未测得 (samples={len(samples)})", flush=True)
+    ok = not errors and rate is not None and rate >= 0.93
+else:
+    ok = (not errors and vf_fps is not None and vf_fps >= _args.min_fps)
 try:
     player.terminate()
 except Exception:
     pass
-ok = (not errors and vf_fps is not None and vf_fps >= _args.min_fps)
 print("IT_RESULT|", "PASS" if ok else "FAIL", flush=True)
 sys.stdout.flush()
 os._exit(0 if ok else 1)
