@@ -192,6 +192,11 @@ class PlaybackMixin:
         self._video_out_h = height
         self._video_out_fps = fps
         self._update_media_info()
+        # RIFE 激活时，视频参数变化（新视频/换源）驱动重新预热并挂 vf
+        if (self._framegen_state.get("backend") == "rife-torch"
+                and width > 0 and height > 0 and fps > 0):
+            self._rife_start_for(width, height, fps)
+            self._update_media_info()
 
     @Slot(int)
     def _on_upscale_factor_changed(self, factor: int):
@@ -206,11 +211,12 @@ class PlaybackMixin:
 
     @Slot(bool, dict)
     def _on_frame_gen_changed(self, enabled: bool, params: dict):
-        """帧生成总入口：按 backend 分流到 display-resample / 小黄鸭。
+        """帧生成总入口：按 backend 分流到 display-resample / 小黄鸭 / RIFE。
 
         - display-resample：走 mpv property（零回归旧伪插帧行为）。
         - lossless-scaling：外部小黄鸭程序，懒启动 + 全屏快捷键驱动，不接入 mpv vf 链。
-        - 关闭/切换前先复位伪插帧 property，并停掉小黄鸭缩放（进程保持常驻）。
+        - rife-torch：mpv vf_vapoursynth + vpy 内 torch(ROCm) 推理真插帧（见 rife_service）。
+        - 关闭/切换前先复位伪插帧 property、清 RIFE vf、停掉小黄鸭缩放（进程保持常驻）。
         """
         player = self._player_widget._player
         if not player:
@@ -227,10 +233,202 @@ class PlaybackMixin:
 
         if backend == "display-resample":
             self._stop_ls_if_selected()
+            self._teardown_rife_if_active(player)
             self._apply_display_resample(player, params)
         elif backend == "lossless-scaling":
+            self._teardown_rife_if_active(player)
             self._enable_lossless_scaling(params)
+        elif backend == "rife-torch":
+            self._apply_rife_torch(player, params)
         self._update_media_info()
+
+    # --- RIFE 真插帧（rife-torch 后端） ---
+
+    def _apply_rife_torch(self, player, params: dict):
+        """RIFE 真插帧入口：记录意图 → prime(后台) → 挂 vf → 验证轮询（黄→绿）。
+
+        视频参数 (w/h/fps) 尚未就绪时（刚发起播放）只记录意图，等
+        _on_video_output_changed 驱动实际预热与挂载；换视频后同机制自动重挂。
+        """
+        self._stop_ls_if_selected()
+        self._rife_params = dict(params)
+        # RIFE 接管 vf 链，与伪插帧/小黄鸭互斥：复位伪插帧 property
+        try:
+            player["interpolation"] = "no"
+            player["video-sync"] = "audio"
+        except (RuntimeError, OSError):
+            pass
+
+        self._framegen_state = {"backend": "rife-torch", "multiplier": 2.0,
+                                "target_fps": 0, "applied": False,
+                                "priming": True, "verified": False}
+        try:
+            vo = player.video_out_params or {}
+            fps = self._player_widget.get_container_fps() or 0.0
+            w, h = int(vo.get("w", 0)), int(vo.get("h", 0))
+        except (RuntimeError, OSError, AttributeError):
+            w = h = fps = 0
+        if w > 0 and h > 0 and fps > 0:
+            self._rife_start_for(w, h, fps)
+        # 否则等待 video_output_changed 携带参数到来
+
+    def _rife_start_for(self, w: int, h: int, fps: float):
+        """按当前视频参数执行/刷新 RIFE 挂载（配置未变则跳过）。"""
+        from src.core.rife_service import fps_to_fraction
+
+        params = self._rife_params or {}
+        model = params.get("model", "v4_25_lite")
+        scale = float(params.get("scale", 0.75))
+        fps_num, fps_den = fps_to_fraction(fps)
+        key = (w, h, fps_num, fps_den, model, scale)
+        if key == self._rife_active_key:
+            return  # 同一视频重复触发（挂 vf 本身会再报 video-out-params）
+
+        self._rife_seq += 1
+        seq = self._rife_seq
+        self._rife_active_key = None
+        self._framegen_state = {"backend": "rife-torch", "multiplier": 2.0,
+                                "target_fps": fps * 2, "applied": False,
+                                "priming": True, "verified": False}
+        self._render_framegen_indicator()
+
+        # prime 放后台线程：torch.load + MIOpen 编译可能耗时数十秒，不能卡 UI
+        def _worker():
+            try:
+                self._rife_service.prime(model, scale, w, h)
+                err = ""
+            except Exception as e:
+                logger.exception("RIFE prime 失败")
+                err = str(e)[:200]
+            self._rife_prime_done.emit(seq, err)
+
+        threading.Thread(target=_worker, daemon=True,
+                         name=f"rife-prime-{seq}").start()
+
+    @Slot(int, str)
+    def _on_rife_prime_done(self, seq: int, err: str):
+        """prime 完成（主线程）：挂 vf 并启动验证轮询，失败则降级。"""
+        if seq != self._rife_seq:
+            return  # 过期回调（用户已切视频/关闭帧生成）
+        if self._framegen_state.get("backend") != "rife-torch":
+            return
+        player = self._player_widget._player
+        if not player:
+            return
+        if err:
+            self._rife_degrade(f"RIFE 预热失败: {err}")
+            return
+        params = self._rife_params or {}
+        try:
+            vpy = self._rife_service.write_vpy(
+                params.get("model", "v4_25_lite"),
+                float(params.get("scale", 0.75)),
+                self._player_widget.get_container_fps() or 0.0,
+            )
+        except Exception as e:
+            self._rife_degrade(f"RIFE vpy 生成失败: {e}")
+            return
+        try:
+            # VS 吃软解帧：硬解 surface 无法进 vf 链，必须切 auto-copy
+            player["hwdec"] = "auto-copy"
+            player["vf"] = self._rife_service.vf_arg(vpy)
+        except (RuntimeError, OSError) as e:
+            self._rife_degrade(f"RIFE vf 注入失败: {e}")
+            return
+        self._rife_mark_applied()
+        self._start_rife_verify()
+        self._update_media_info()
+
+    def _rife_mark_applied(self):
+        """记录当前已挂载配置（video_output_changed 去重用），状态转『启动中』。"""
+        from src.core.rife_service import fps_to_fraction
+        params = self._rife_params or {}
+        try:
+            fps = self._player_widget.get_container_fps() or 0.0
+            vo = self._player_widget._player.video_out_params or {}
+            fps_num, fps_den = fps_to_fraction(fps)
+            self._rife_active_key = (int(vo.get("w", 0)), int(vo.get("h", 0)),
+                                     fps_num, fps_den,
+                                     params.get("model", "v4_25_lite"),
+                                     float(params.get("scale", 0.75)))
+        except (RuntimeError, OSError, ValueError):
+            self._rife_active_key = None
+        st = self._framegen_state
+        st.update({"applied": True, "priming": False, "verified": False})
+
+    def _start_rife_verify(self):
+        """启动『黄→绿』验证轮询：estimated-vf-fps 达到源 1.45x 连续 2 次判生效。"""
+        if not hasattr(self, "_rife_verify_timer") or self._rife_verify_timer is None:
+            self._rife_verify_timer = QTimer(self)
+            self._rife_verify_timer.setInterval(700)
+            self._rife_verify_timer.timeout.connect(self._rife_verify_tick)
+        self._rife_verify_good = 0
+        self._rife_verify_ticks = 0
+        self._rife_verify_timer.start()
+        self._render_framegen_indicator()
+
+    def _rife_verify_tick(self):
+        """验证轮询：达标→绿；暂停期间挂起计数；~18 拍(约12.6s)未达标→降级。"""
+        st = self._framegen_state
+        if st.get("backend") != "rife-torch" or not st.get("applied"):
+            self._rife_verify_timer.stop()
+            return
+        if self._last_state != "playing":
+            return  # 暂停/缓冲中 vf 输不出帧率，不计入超时
+        vfps = self._player_widget.get_estimated_vf_fps() or 0.0
+        target = (st.get("target_fps") or 0) * 0.725  # ≈ 源fps × 2 × 0.725
+        if target > 0 and vfps >= target:
+            self._rife_verify_good += 1
+        else:
+            self._rife_verify_good = 0
+        self._rife_verify_ticks += 1
+        if self._rife_verify_good >= 2:
+            self._rife_verify_timer.stop()
+            st["verified"] = True
+            self._render_framegen_indicator()
+            self._update_media_info()
+        elif self._rife_verify_ticks > 18:
+            self._rife_verify_timer.stop()
+            self._rife_degrade("RIFE 启动超时（vf 未产出补帧，详见日志）")
+
+    def _rife_degrade(self, reason: str):
+        """RIFE 失败自动降级：清 vf / 恢复硬解 / 面板回落伪插帧。"""
+        logger.warning("RIFE 降级: %s", reason)
+        player = self._player_widget._player
+        self._rife_seq += 1  # 作废在途 prime 回调
+        self._rife_active_key = None
+        if player:
+            try:
+                player.command("vf", "set", "")
+            except (RuntimeError, OSError):
+                pass
+            try:
+                player["hwdec"] = "auto-safe"
+            except (RuntimeError, OSError):
+                pass
+        self._framegen_state = {"backend": "off", "multiplier": 1.0,
+                                "target_fps": 0, "applied": False}
+        self._update_media_info()
+        self._status_label.setText(f"{reason} — 已回退到伪插帧")
+        # 面板回落 display-resample（idx0），信号链会自动应用伪插帧
+        self._video_enhance_panel.fallback_after_rife_failure()
+
+    def _teardown_rife_if_active(self, player):
+        """切走/关闭帧生成时：若 RIFE vf 已挂载则清 vf 并恢复硬解。"""
+        if self._rife_active_key is None:
+            return
+        self._rife_seq += 1
+        self._rife_active_key = None
+        if hasattr(self, "_rife_verify_timer") and self._rife_verify_timer is not None:
+            self._rife_verify_timer.stop()
+        try:
+            player.command("vf", "set", "")
+        except (RuntimeError, OSError):
+            pass
+        try:
+            player["hwdec"] = "auto-safe"
+        except (RuntimeError, OSError):
+            pass
 
     def _stop_ls_if_selected(self):
         """切走/关闭帧生成时：若之前选中小黄鸭，停掉缩放（进程保持常驻）。"""
@@ -305,7 +503,8 @@ class PlaybackMixin:
             pass
 
     def _teardown_frame_gen(self, player):
-        """关闭帧生成：仅复位伪插帧 property（不再有 vf 路径）。"""
+        """关闭帧生成：清 RIFE vf、复位伪插帧 property。"""
+        self._teardown_rife_if_active(player)
         try:
             player["video-sync"] = "audio"
             player["interpolation"] = "no"

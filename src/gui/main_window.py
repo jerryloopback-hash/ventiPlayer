@@ -21,6 +21,7 @@ from src.core.audio_pipe import AudioPipeline
 from src.core.video_export import VideoExporter
 from src.core.sync import SyncManager
 from src.core.frame_gen import FrameGenManager
+from src.core.rife_service import RifeFrameGenService
 from src.core.lossless_scaling import LosslessScalingController
 from src.core.subtitle import SubtitlePipeline
 from src.config.settings import Settings
@@ -63,6 +64,7 @@ class MainWindow(
     backend_ready = Signal()  # emitted when enhance panel backend info is set
     _export_progress = Signal(float, str)   # 视频导出进度（后台线程→主线程）
     _export_done = Signal(object)            # 视频导出完成，携带 ExportResult
+    _rife_prime_done = Signal(int, str)      # RIFE 预热完成（后台线程→主线程: seq, 错误）
 
     def __init__(self, predetected_device=None):
         super().__init__()
@@ -104,8 +106,10 @@ class MainWindow(
         self._exporter: VideoExporter | None = None
         self._export_dialog: QProgressDialog | None = None
 
-        # Frame generation manager（仅做后端依赖检测：display-resample + 小黄鸭）
+        # Frame generation manager（后端依赖检测：display-resample + 小黄鸭 + RIFE）
         self._frame_gen_mgr = FrameGenManager()
+        # RIFE 真插帧服务（vpy 生成 + 模型预热；播放接线在 PlaybackMixin）
+        self._rife_service = RifeFrameGenService()
         # 小黄鸭 (Lossless Scaling) 外部全屏补帧控制器（懒启动，常驻）
         self._ls_controller = LosslessScalingController(
             self._settings.get("lossless_scaling_path") or "",

@@ -257,14 +257,19 @@ class UiSetupMixin:
         self._video_out_fps: float = 0.0  # actual video output fps
         self._upscale_factor: int = 1  # 1 = no upscale, 2 = x2 shader active
         self._upscale_actually_active: bool = False  # True only when upscale shaders verified loaded
-        # 帧生成状态：backend(off|display-resample|lossless-scaling) / multiplier /
-        # target_fps(0=倍率模式) / applied(是否真正生效)
+        # 帧生成状态：backend(off|display-resample|lossless-scaling|rife-torch) /
+        # multiplier / target_fps(0=倍率模式) / applied(是否真正生效) /
+        # priming(RIFE 预热中) / verified(RIFE 已确认产出补帧)
         self._framegen_state: dict = {
             "backend": "off",
             "multiplier": 1.0,
             "target_fps": 0,
             "applied": False,
         }
+        # RIFE 真插帧运行态：意图参数 / 当前已挂载配置键 / 预热线程序号
+        self._rife_params: dict | None = None
+        self._rife_active_key: tuple | None = None
+        self._rife_seq: int = 0
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._toggle_pause)
@@ -316,6 +321,8 @@ class UiSetupMixin:
         self._video_enhance_panel.hdr_changed.connect(self._on_video_hdr_changed)
         self._video_enhance_panel.upscale_factor_changed.connect(self._on_upscale_factor_changed)
         self._video_enhance_panel.frame_gen_changed.connect(self._on_frame_gen_changed)
+        # RIFE 预热完成（后台线程→主线程）
+        self._rife_prime_done.connect(self._on_rife_prime_done)
         # Content browser signals
         self._content_browser.play_video.connect(self._on_browser_play)
         self._content_browser.play_video_with_context.connect(self._on_browser_play_with_context)

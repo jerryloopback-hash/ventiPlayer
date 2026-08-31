@@ -59,6 +59,20 @@ _ANIME4K_MODES = ["A", "B", "C", "A+A", "B+B", "C+A"]
 _ANIME4K_QUALITIES = list(_ANIME4K_QUALITY_MAP.keys())
 _ANIME4K_SCALES = ["x2", "x4"]
 
+# RIFE 真插帧：模型下拉（显示名 → 版本标识）与推理档位（显示名 → scale）。
+# 档位实测（RX 9070 fp16, tools/rife_spike/report_torch_matrix.md）:
+#   1080p: native 47fps / down0.75 73fps / down0.5 137fps；24fps 源 x2 需 >=48fps
+_RIFE_MODEL_ITEMS = [
+    ("RIFE v4.25 lite (默认)", "v4_25_lite"),
+    ("RIFE v4.26", "v4_26"),
+    ("RIFE v4.25", "v4_25"),
+]
+_RIFE_SCALE_ITEMS = [
+    ("1.0 原生 (最清晰)", 1.0),
+    ("0.75 (推荐)", 0.75),
+    ("0.5 (最快)", 0.5),
+]
+
 _ANIME4K_MODE_DESC = {
     "A": "1080p动画 / 高模糊源",
     "B": "720p动画 / 低模糊源",
@@ -112,10 +126,11 @@ class VideoEnhancePanel(QWidget):
     def __init__(self, parent=None, frame_gen_caps: dict | None = None):
         super().__init__(parent)
         # 帧生成依赖能力（由 main_window 传入 FrameGenManager.check_dependencies() 结果）。
-        # 缺省给一个小黄鸭不可用的安全值，仅 display-resample 可用。
+        # 缺省给安全值：仅 display-resample 可用。
         self._fg_caps = frame_gen_caps or {
             "display_resample": True,
             "lossless_scaling": {"available": False, "reason": "", "exe_path": ""},
+            "rife_torch": {"available": False, "reason": "", "versions": []},
         }
         self._setup_ui()
         self._refresh_dep_hint()
@@ -433,13 +448,14 @@ class VideoEnhancePanel(QWidget):
         fg_layout.setContentsMargins(16, 0, 0, 0)
         fg_layout.setSpacing(2)
 
-        # backend 下拉：display-resample 伪插帧（恒可用） + 小黄鸭外部全屏补帧。
+        # backend 下拉：display-resample 伪插帧（恒可用） + 小黄鸭 + RIFE AI 真插帧。
         row_backend = QHBoxLayout()
         row_backend.addWidget(QLabel("后端:"))
         self._fg_backend = QComboBox()
         self._fg_backend.addItems([
             "display-resample (伪插帧)",            # idx 0（默认，恒可用）
             "小黄鸭 (Lossless Scaling 全屏补帧)",   # idx 1
+            "RIFE AI 真插帧 (torch ROCm)",          # idx 2
         ])
         self._fg_backend.currentIndexChanged.connect(self._on_fg_backend_changed)
         row_backend.addWidget(self._fg_backend, 1)
@@ -513,6 +529,35 @@ class VideoEnhancePanel(QWidget):
         ls_info3.setWordWrap(True)
         ls.addWidget(ls_info3)
         self._fg_params_stack.addWidget(page_ls)  # index 1
+
+        # page2: RIFE AI 真插帧（模型 + 推理档位）
+        page_rife = QWidget()
+        rf = QVBoxLayout(page_rife)
+        rf.setContentsMargins(0, 0, 0, 0)
+        rf.setSpacing(2)
+        row_rife_model = QHBoxLayout()
+        row_rife_model.addWidget(QLabel("模型:"))
+        self._rife_model = QComboBox()
+        for display, version in _RIFE_MODEL_ITEMS:
+            self._rife_model.addItem(display, version)
+        self._rife_model.currentIndexChanged.connect(self._on_fg_params_changed)
+        row_rife_model.addWidget(self._rife_model, 1)
+        rf.addLayout(row_rife_model)
+        row_rife_scale = QHBoxLayout()
+        row_rife_scale.addWidget(QLabel("档位:"))
+        self._rife_scale = QComboBox()
+        for display, scale in _RIFE_SCALE_ITEMS:
+            self._rife_scale.addItem(display, scale)
+        self._rife_scale.setCurrentIndex(1)  # 默认 down0.75（1080p 实测 73fps 余量足）
+        self._rife_scale.currentIndexChanged.connect(self._on_fg_params_changed)
+        row_rife_scale.addWidget(self._rife_scale, 1)
+        rf.addLayout(row_rife_scale)
+        rife_info = QLabel("AI 模型补帧至 2x 帧率；首次启用需加载模型（数秒）。\n"
+                           "4K/高帧率源建议降档，1080p 24/30fps 源推荐 0.75 档。")
+        rife_info.setStyleSheet("color: gray; font-size: 10px;")
+        rife_info.setWordWrap(True)
+        rf.addWidget(rife_info)
+        self._fg_params_stack.addWidget(page_rife)  # index 2
 
         fg_layout.addWidget(self._fg_params_stack)
         right_col.addWidget(self._fg_widget)
@@ -608,8 +653,8 @@ class VideoEnhancePanel(QWidget):
             self.frame_gen_changed.emit(False, {})
 
     def _on_fg_backend_changed(self, idx: int):
-        # 0 -> display-resample 页(0); 1 -> 小黄鸭说明页(1)
-        self._fg_params_stack.setCurrentIndex(1 if idx == 1 else 0)
+        # 0 -> display-resample 页(0); 1 -> 小黄鸭说明页(1); 2 -> RIFE 参数页(2)
+        self._fg_params_stack.setCurrentIndex(idx)
         self._refresh_dep_hint()
         self._update_fg_descs()
         if self._enable_fg.isChecked():
@@ -634,21 +679,27 @@ class VideoEnhancePanel(QWidget):
             self._interp_threshold_desc.setText(f"帧率差>{threshold}x时插值")
 
     def _refresh_dep_hint(self):
-        """根据依赖能力灰显小黄鸭项，并显示原因提示。"""
+        """根据依赖能力灰显小黄鸭/RIFE 项，并显示原因提示。"""
         caps = self._fg_caps
         ls_ok = caps.get("lossless_scaling", {}).get("available", False)
+        rife_ok = caps.get("rife_torch", {}).get("available", False)
         model = self._fg_backend.model()
         self._set_item_enabled(model, 1, ls_ok)   # 小黄鸭
+        self._set_item_enabled(model, 2, rife_ok)  # RIFE
 
-        # 若当前选中小黄鸭但不可用，回落到 display-resample(idx0)
+        # 若当前选中项不可用，回落到 display-resample(idx0)
         bidx = self._fg_backend.currentIndex()
-        if bidx == 1 and not ls_ok:
+        if (bidx == 1 and not ls_ok) or (bidx == 2 and not rife_ok):
             self._fg_backend.setCurrentIndex(0)
             bidx = 0
 
-        if not ls_ok:
+        if bidx == 1 and not ls_ok:
             reason = caps.get("lossless_scaling", {}).get("reason") or "依赖未就绪"
             self._fg_dep_hint.setText(f"小黄鸭不可用：{reason}")
+            self._fg_dep_hint.setVisible(True)
+        elif bidx == 2 and not rife_ok:
+            reason = caps.get("rife_torch", {}).get("reason") or "依赖未就绪"
+            self._fg_dep_hint.setText(f"RIFE 不可用：{reason}")
             self._fg_dep_hint.setVisible(True)
         else:
             self._fg_dep_hint.setVisible(False)
@@ -660,7 +711,7 @@ class VideoEnhancePanel(QWidget):
         if item is not None:
             item.setEnabled(enabled)
 
-    _BACKEND_KEY = {0: "display-resample", 1: "lossless-scaling"}
+    _BACKEND_KEY = {0: "display-resample", 1: "lossless-scaling", 2: "rife-torch"}
 
     def _emit_frame_gen(self):
         enabled = self._enable_fg.isChecked()
@@ -668,6 +719,12 @@ class VideoEnhancePanel(QWidget):
         backend = self._BACKEND_KEY.get(bidx, "display-resample")
         if backend == "lossless-scaling":
             params = {"backend": "lossless-scaling"}
+        elif backend == "rife-torch":
+            params = {
+                "backend": "rife-torch",
+                "model": self._rife_model.currentData() or "v4_25_lite",
+                "scale": float(self._rife_scale.currentData() or 0.75),
+            }
         else:
             params = {
                 "backend":   "display-resample",
@@ -890,6 +947,8 @@ class VideoEnhancePanel(QWidget):
         self._enable_fg.setChecked(False)
         self._fg_backend.setCurrentIndex(0)        # 默认 display-resample
         self._fg_params_stack.setCurrentIndex(0)
+        self._rife_model.setCurrentIndex(0)
+        self._rife_scale.setCurrentIndex(1)        # 默认 down0.75
         self._tscale_algo.setCurrentIndex(0)
         self._interp_threshold.setValue(-1)
         self._refresh_dep_hint()
@@ -898,6 +957,15 @@ class VideoEnhancePanel(QWidget):
         self.hdr_changed.emit(False, {})
         self.upscale_factor_changed.emit(1)
         self.frame_gen_changed.emit(False, {})
+
+    def fallback_after_rife_failure(self):
+        """RIFE 启动失败后的自动降级（由 playback 调用）：静默切回伪插帧。
+
+        setCurrentIndex 触发 _on_fg_backend_changed → _emit_frame_gen → 应用伪插帧，
+        UI 与 mpv 状态保持一致。
+        """
+        if self._fg_backend.currentIndex() == 2:
+            self._fg_backend.setCurrentIndex(0)
 
     def set_frame_gen_caps(self, caps: dict):
         """更新帧生成依赖能力并刷新后端可选项（供 main_window 在异步检测后调用）。"""

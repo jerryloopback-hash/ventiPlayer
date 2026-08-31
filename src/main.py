@@ -71,6 +71,13 @@ _setup_exception_hooks()
 _project_root = str(Path(__file__).resolve().parent.parent)
 os.environ["PATH"] = _project_root + os.pathsep + os.environ.get("PATH", "")
 
+# VapourSynth portable wheel 的 DLL 目录注入 PATH：vf_vapoursynth 在 mpv 进程内
+# 评估 vpy 时会 `import vapoursynth`，该包经 ctypes 定位 vapoursynth.dll 依赖 PATH
+# （Phase 0/1 spike 验证，必须早于任何 mpv 初始化）。
+_vs_pkg = Path(sys.executable).parent.parent / "Lib" / "site-packages" / "vapoursynth"
+if _vs_pkg.is_dir():
+    os.environ["PATH"] = str(_vs_pkg) + os.pathsep + os.environ.get("PATH", "")
+
 
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 

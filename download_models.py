@@ -61,10 +61,49 @@ def main():
         url = f"{HF_MIRROR}/{FLASHSR_REPO}/resolve/main/{fname}"
         _download(url, FLASHSR_DIR / fname)
 
+    print("\n--- RIFE (video frame interpolation, torch ROCm) ---")
+    print("  (~24 MB per version)")
+    _download_rife()
+
     print("\n=== Done ===")
     print("Models can now run offline.")
     print("Note: the FlashSR model code is vendored in src/models/flashsr_src/,")
     print("      and Apollo's config is also bundled in src/models/apollo_src/configs/.")
+
+
+# RIFE weights — Practical-RIFE official train_log zips (via hf-mirror for CN access).
+# 只取包内 flownet.pkl；模型结构代码 vendor 在 src/models/rife/（inference-only）。
+RIFE_REPO = "Bash2X/RIFE-Models"
+RIFE_VERSIONS = ["v4_25_lite", "v4_25", "v4_26"]
+_RIFE_ZIP = {"v4_25_lite": "RIFE_v4.25.lite.zip", "v4_25": "RIFE_v4.25.zip",
+             "v4_26": "RIFE_v4.26.zip"}
+
+
+def _download_rife():
+    import io
+    import zipfile
+    from urllib.request import urlopen
+
+    for version in RIFE_VERSIONS:
+        dest = MODELS_DIR / "rife" / version / "train_log" / "flownet.pkl"
+        if dest.exists() and dest.stat().st_size > 0:
+            print(f"  Already exists: {version}/flownet.pkl "
+                  f"({dest.stat().st_size / 1024 / 1024:.1f} MB)")
+            continue
+        url = f"{HF_MIRROR}/{RIFE_REPO}/resolve/main/{_RIFE_ZIP[version]}"
+        print(f"  Downloading: {url}")
+        try:
+            with urlopen(url) as resp:
+                data = resp.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                member = next(n for n in zf.namelist()
+                              if n.endswith("flownet.pkl"))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(zf.read(member))
+            print(f"  Saved: {dest} ({dest.stat().st_size / 1024 / 1024:.1f} MB)")
+        except Exception as e:
+            print(f"  [ERROR] Download failed: {e}")
+            print(f"  Manual download: {url}\n  Place at: {dest}")
 
 
 if __name__ == "__main__":

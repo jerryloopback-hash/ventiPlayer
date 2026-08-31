@@ -112,3 +112,9 @@ shaders/Denoise_active.glsl
 *.mp4
 *.mkv
 *.mov
+
+# RIFE spike 大文件（脚本与报告保留；权重/运行时可由 download_models.py 与官方源重建）
+tools/rife_spike/dl/
+tools/rife_spike/runtime/
+tools/rife_spike/torch_models/
+tools/rife_spike/test_*.mp4

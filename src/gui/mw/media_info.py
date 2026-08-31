@@ -60,6 +60,11 @@ class MediaInfoMixin:
                         effective_out_fps = round(display_fps, 1)
                 except Exception:
                     pass
+            elif fg_backend == "rife-torch" and fg_applied:
+                # RIFE 真插帧：vf 输出实测帧率（≈源 x2）
+                evf = self._player_widget.get_estimated_vf_fps()
+                if evf and evf > 0:
+                    effective_out_fps = round(evf, 1)
             # 小黄鸭(lossless-scaling)是外部叠加补帧，mpv 仍只输出源帧，无需调整 effective_out_fps
 
             # Show output resolution: use upscale factor applied to video-out-params
@@ -135,6 +140,7 @@ class MediaInfoMixin:
         - off               灰 源帧率
         - display-resample  绿 伪插帧（注入即生效）
         - lossless-scaling  绿 小黄鸭 生效（已发送快捷键开启缩放）/ 黄 小黄鸭 待全屏
+        - rife-torch        黄 RIFE 预热中/启动中 → 绿 RIFE 插帧（实测达 2x）
         """
         st = self._framegen_state
         backend = st.get("backend", "off")
@@ -150,6 +156,21 @@ class MediaInfoMixin:
                 self._framegen_indicator.setText(
                     '<span style="color:#FFEB3B;font-size:14px;">●</span> 小黄鸭 待全屏')
             return
+        if backend == "rife-torch":
+            if st.get("priming"):
+                self._framegen_indicator.setText(
+                    '<span style="color:#FFEB3B;font-size:14px;">●</span> RIFE 预热中')
+                return
+            applied = self._verify_framegen_applied(backend)
+            st["applied"] = applied
+            if not applied or not st.get("verified"):
+                # vf 已注入但尚未确认产出补帧（或 mpv 端 vf 意外丢失）
+                self._framegen_indicator.setText(
+                    '<span style="color:#FFEB3B;font-size:14px;">●</span> RIFE 启动中')
+                return
+            self._framegen_indicator.setText(
+                '<span style="color:#4CAF50;font-size:14px;">●</span> RIFE 插帧')
+            return
         applied = self._verify_framegen_applied(backend)
         st["applied"] = applied
         if not applied:
@@ -164,14 +185,18 @@ class MediaInfoMixin:
         """帧生成是否真正生效。
 
         - lossless-scaling：以小黄鸭是否已开启缩放为准。
+        - rife-torch：预热完成 + vf 注入 + 验证轮询确认产出补帧。
         - display-resample：注入即生效（applied 已校验）。
         """
         if self._framegen_state.get("backend") == "lossless-scaling":
             return self._ls_controller.is_scaling
+        if self._framegen_state.get("backend") == "rife-torch":
+            return bool(self._framegen_state.get("applied")
+                        and self._framegen_state.get("verified"))
         return self._framegen_state.get("applied", False)
 
     def _verify_framegen_applied(self, backend: str) -> bool:
-        """校验后端是否真正生效：伪插帧查 video-sync，小黄鸭看是否已选中。"""
+        """校验后端是否真正生效：伪插帧查 video-sync，RIFE 查 vf 链，小黄鸭看是否已选中。"""
         if backend == "lossless-scaling":
             return self._ls_backend_selected
         try:
@@ -180,6 +205,9 @@ class MediaInfoMixin:
                 return False
             if backend == "display-resample":
                 return player["video-sync"] == "display-resample"
+            if backend == "rife-torch":
+                vf_list = player["vf"]
+                return bool(vf_list) and "vapoursynth" in str(vf_list)
             return False
         except Exception:
             return False
