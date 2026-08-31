@@ -85,38 +85,85 @@ PH = (PAD - DH % PAD) % PAD
 PW = (PAD - DW % PAD) % PAD
 
 def _half(f, x0, x1):
-    """读帧三平面列区间 [x0:x1] → (3, h, w) cpu fp32 tensor（含 stride 处理）。"""
+    """读帧三平面列区间 [x0:x1] → (3, h, w) cpu tensor（含 stride 处理）。
+
+    用 strided view 直入 torch（无 numpy 拷贝），由 .cuda() 一次性打包上传。
+    """
     h, w = f.height, x1 - x0
     planes = []
     for p in range(3):
         stride = f.get_stride(p) // 4
         ptr = ctypes.cast(f.get_read_ptr(p), ctypes.POINTER(ctypes.c_float))
         row = np.ctypeslib.as_array(ptr, shape=(h, stride))
-        planes.append(torch.from_numpy(np.ascontiguousarray(row[:, x0:x1])))
+        planes.append(torch.from_numpy(row[:, x0:x1]))
     return torch.stack(planes)
+
+# ---- 单一专用推理线程 ----
+# torch/MIOpen handle 是 per-thread 的（实测新线程首推 ~700ms），VS 默认开
+# CPU 核数个工作线程轮流评估回调 → 每线程首帧触发 handle 初始化，表现为
+# 播放长期卡顿（实测 1080p down0.5 仅 6.4 pairs/s vs 基准 137fps）。
+# 收拢到单 worker 线程后 handle 终生复用（实测 9ms/对，111 pairs/s）。
+import threading as _th
+import queue as _q
+
+_infer_q = _q.Queue()
+
+def _infer_worker():
+    while True:
+        box = _infer_q.get()
+        if box is None:
+            return
+        try:
+            with torch.no_grad():
+                box["r"] = model.inference(box["a"], box["b"], TS, scale=1.0)
+        except BaseException as _e:
+            box["e"] = _e
+        box["ev"].set()
+
+_th.Thread(target=_infer_worker, daemon=True).start()
+
+def _submit_infer(a, b):
+    box = {"a": a, "b": b, "ev": _th.Event()}
+    _infer_q.put(box)
+    return box
+
+# 求值期预热 worker 的 MIOpen handle（首个推理的 per-thread 初始化提前到
+# 挂 vf 之前完成，首帧回调零冲击；kernel 已由宿主 prime 落盘缓存）
+_warm = torch.zeros(1, 3, DH + PH, DW + PW, device="cuda", dtype=DT)
+_box = _submit_infer(_warm, _warm)
+_box["ev"].wait()
+del _warm, _box
 
 def rife_cb(n, f):
     # VS/mpv 日志通道会截断深层 traceback，回调异常必须自行落盘才能定位根因
     try:
-        with torch.no_grad():
-            t0 = _half(f, 0, f.width // 2).cuda().to(DT)
-            t1 = _half(f, f.width // 2, f.width).cuda().to(DT)
-            if MODE == "down":
-                a = F.interpolate(t0[None], size=(DH, DW), mode="bilinear",
-                                  align_corners=False)
-                b = F.interpolate(t1[None], size=(DH, DW), mode="bilinear",
-                                  align_corners=False)
-                a = F.pad(a, (0, PW, 0, PH))
-                b = F.pad(b, (0, PW, 0, PH))
-                out = model.inference(a, b, TS, scale=1.0)
-                out = out[:, :, :DH, :DW]
-                out = F.interpolate(out.float(), size=(H, W), mode="bilinear",
-                                    align_corners=False)[0]
-            else:
-                a = F.pad(t0[None], (0, PW, 0, PH))
-                b = F.pad(t1[None], (0, PW, 0, PH))
-                out = model.inference(a, b, TS, scale=1.0)[0, :, :H, :W].float()
-            mid = out.clamp_(0.0, 1.0).cpu().numpy()
+        t0 = _half(f, 0, f.width // 2).cuda().to(DT)
+        t1 = _half(f, f.width // 2, f.width).cuda().to(DT)
+        if MODE == "down":
+            a = F.interpolate(t0[None], size=(DH, DW), mode="bilinear",
+                              align_corners=False)
+            b = F.interpolate(t1[None], size=(DH, DW), mode="bilinear",
+                              align_corners=False)
+            a = F.pad(a, (0, PW, 0, PH))
+            b = F.pad(b, (0, PW, 0, PH))
+            box = _submit_infer(a, b)
+            box["ev"].wait()
+            if "e" in box:
+                raise box["e"]
+            out = box["r"]
+            out = out[:, :, :DH, :DW]
+            out = F.interpolate(out.float(), size=(H, W), mode="bilinear",
+                                align_corners=False)[0]
+        else:
+            a = F.pad(t0[None], (0, PW, 0, PH))
+            b = F.pad(t1[None], (0, PW, 0, PH))
+            box = _submit_infer(a, b)
+            box["ev"].wait()
+            if "e" in box:
+                raise box["e"]
+            out = box["r"]
+            out = out[0, :, :H, :W].float()
+        mid = out.clamp_(0.0, 1.0).cpu().numpy()
     except BaseException:
         # VS/mpv 日志通道截断深层 traceback，异常必须自行落盘/打 stderr 才能定位
         try:
