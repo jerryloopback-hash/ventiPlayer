@@ -3,6 +3,7 @@
 本模块是编排入口；实现拆分在 src/core/export/ 包：
     common.py    — ExportSettings / ExportResult / 格式化工具
     audio.py     — 音频子管线（解码 → Apollo/FlashSR → WAV）
+    bake_rife.py — RIFE 真插帧烘焙 pass（Phase 2，帧率×2）
     bake_gpu.py  — 离屏 GPU 渲染真实烘焙（primary）
     bake_pyav.py — PyAV 近似烘焙（退化回退）+ 共享编码器工具
     mux.py       — 混流
@@ -79,8 +80,13 @@
 - 画面烘焙策略 = 离屏 GPU 渲染真实烘焙（primary，见 export/bake_gpu.py）；
   失败退化到 PyAV 近似（export/bake_pyav.py），并在 ExportResult.gpu_baked=False
   且 message 里明确告知用户。
-- 插帧不烘焙：display-resample 伪插帧是显示期属性（依赖显示器刷新率），无法写进文件；
-  小黄鸭(Lossless Scaling)是外部全屏叠加程序——两者导出时一律忽略，导出文件保持源帧率。
+- RIFE 真插帧可烘焙（export/bake_rife.py，帧率×2，与实时链共享推理内核）：
+  纯 RIFE 直接产出最终文件（保留源位深）；与画面增强同开时先插帧出中间
+  文件、再走既有烘焙（先插帧后超分，与实时管线顺序一致）。失败降级为不
+  插帧导出并在 message 说明。
+- 插帧不烘焙的仅剩：display-resample 伪插帧（显示期属性，依赖显示器刷新率，
+  无法写进文件）与小黄鸭(Lossless Scaling)（外部全屏叠加程序）——两者导出
+  时一律忽略，导出文件保持源帧率。
 """
 
 import logging
@@ -100,6 +106,7 @@ from src.core.export.common import (
     DoneCallback,
 )
 from src.core.export.audio import AudioPipelineMixin
+from src.core.export.bake_rife import RifeBakeMixin
 from src.core.export.bake_gpu import GpuBakeMixin
 from src.core.export.bake_pyav import VideoEncoderMixin
 from src.core.export.mux import MuxMixin
@@ -110,11 +117,13 @@ __all__ = ["VideoExporter", "ExportSettings", "ExportResult",
 logger = logging.getLogger(__name__)
 
 
-class VideoExporter(AudioPipelineMixin, GpuBakeMixin, VideoEncoderMixin, MuxMixin):
+class VideoExporter(AudioPipelineMixin, RifeBakeMixin, GpuBakeMixin,
+                    VideoEncoderMixin, MuxMixin):
     """把视频连同音频/画面增强真实烘焙为 mp4。后台线程执行，进度/完成走回调。
 
-    画面烘焙优先离屏 GPU 渲染（_bake_video_gpu）；失败则退化 PyAV 近似
-    （_bake_video_pyav）。音频复用现有 Apollo/FlashSR 离线链。
+    画面烘焙顺序：可选 RIFE 插帧 pass（_bake_video_rife）→ 离屏 GPU 渲染
+    （_bake_video_gpu）→ 失败退化 PyAV 近似（_bake_video_pyav）。
+    音频复用现有 Apollo/FlashSR 离线链。
     """
 
     def __init__(self, enhancer):
@@ -201,19 +210,49 @@ class VideoExporter(AudioPipelineMixin, GpuBakeMixin, VideoEncoderMixin, MuxMixi
             audio_wav, audio_sr = self._prepare_audio(audio_url, http_headers, es)
             self._check_cancel()
 
-            # (b) 画面烘焙：优先离屏 GPU，失败退化 PyAV
-            tmp_video = self._tmp_path(es.output_path, "_baked.mp4")
+            # (b) 画面烘焙：可选 RIFE 插帧前置 pass + 既有 GPU/PyAV 增强烘焙
+            rife_fg = self._rife_fg_request(es)
+            pure_rife = self._is_pure_rife(es) if rife_fg else False
+            rife_baked = False
             gpu_baked = False
-            try:
-                vinfo = self._bake_video_gpu(video_url, http_headers, es, tmp_video)
-                gpu_baked = True
-            except InterruptedError:
-                raise
-            except Exception as e:
-                logger.warning("离屏 GPU 烘焙失败，退化为 PyAV 近似: %s", e, exc_info=True)
-                self._report(0.35, "GPU 渲染不可用，改用 PyAV 近似烘焙...")
-                vinfo = self._bake_video_pyav(video_url, http_headers, es, tmp_video)
-                gpu_baked = False
+            rife_degraded = ""
+            vinfo = {}
+            bake_src, bake_headers = video_url, http_headers
+            tmp_video = self._tmp_path(es.output_path, "_baked.mp4")
+            if rife_fg:
+                # 插帧 pass 先行：纯 RIFE 直接产最终视频；组合时产高质量中间文件
+                # （插帧文件写到临时路径，混流时才落到 output_path，避免边写边读）
+                rife_out = self._tmp_path(es.output_path, "_rife.mp4")
+                try:
+                    vinfo = self._bake_video_rife(
+                        video_url, http_headers, rife_fg, rife_out,
+                        pure=pure_rife)
+                    bake_src = rife_out
+                    rife_baked = True
+                    if not pure_rife:
+                        bake_headers = None  # 中间文件是本地 mp4，无需 http headers
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    logger.warning("RIFE 插帧烘焙失败，降级为不插帧导出: %s",
+                                   e, exc_info=True)
+                    rife_degraded = f"RIFE 插帧未能烘焙，已按源帧率导出（{e}）"
+                    bake_src, bake_headers = video_url, http_headers
+            self._check_cancel()
+
+            if rife_baked and pure_rife:
+                tmp_video = bake_src  # 纯 RIFE：插帧产物即最终视频，无需第二遍
+            if not (rife_baked and pure_rife):
+                try:
+                    vinfo = self._bake_video_gpu(bake_src, bake_headers, es, tmp_video)
+                    gpu_baked = True
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    logger.warning("离屏 GPU 烘焙失败，退化为 PyAV 近似: %s", e, exc_info=True)
+                    self._report(0.35, "GPU 渲染不可用，改用 PyAV 近似烘焙...")
+                    vinfo = self._bake_video_pyav(bake_src, bake_headers, es, tmp_video)
+                    gpu_baked = False
             self._check_cancel()
 
             # (c) 混流：烘焙视频 + 增强音频 → 最终 mp4
@@ -224,20 +263,25 @@ class VideoExporter(AudioPipelineMixin, GpuBakeMixin, VideoEncoderMixin, MuxMixi
             # (d) 汇报真实参数
             result.success = True
             result.gpu_baked = gpu_baked
+            result.gpu_degraded = (not gpu_baked) and not (rife_baked and pure_rife)
+            result.framegen_baked = rife_baked
             result.container_format = "mp4"
             result.width = vinfo.get("width", 0)
             result.height = vinfo.get("height", 0)
             result.fps = vinfo.get("fps", 0.0)
             result.audio_sr = audio_sr
             result.audio_cutoff_hz = self._compute_audio_cutoff(es, audio_sr) or 0
-            if not gpu_baked:
-                result.message = (
-                    "导出成功，但当前环境无法创建离屏 GPU 渲染上下文，已退化为 PyAV "
-                    "近似烘焙：亮度/对比度/饱和度/gamma、降噪、按倍率缩放已尽力套用，"
-                    "但 GLSL 着色器（Anime4K/FSR 超分、CAS 锐化等）未能真实烘焙。"
-                )
-            else:
-                result.message = "导出成功"
+            notes = []
+            if rife_baked:
+                notes.append("RIFE 真插帧已烘焙进文件（帧率翻倍）")
+            elif rife_degraded:
+                notes.append(rife_degraded)
+            if not gpu_baked and not (rife_baked and pure_rife):
+                notes.append(
+                    "当前环境无法创建离屏 GPU 渲染上下文，已退化为 PyAV 近似烘焙："
+                    "亮度/对比度/饱和度/gamma、降噪、按倍率缩放已尽力套用，"
+                    "但 GLSL 着色器（Anime4K/FSR 超分、CAS 锐化等）未能真实烘焙")
+            result.message = "导出成功" + ("：" + "；".join(notes) if notes else "")
             self._report(1.0, "导出完成")
 
         except InterruptedError:

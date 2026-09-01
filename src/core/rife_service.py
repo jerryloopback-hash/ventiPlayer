@@ -4,19 +4,23 @@
   mpv 的 vf_vapoursynth 在宿主进程内用同一个 python312.dll 评估 vpy —— vpy 与
   宿主共享 interpreter（Phase 1 探针实测 sys 属性互通），因此:
     1. 宿主后台线程 prime(): 构建模型 + MIOpen 预热 → src.models.rife 模块级缓存
-    2. vpy 直接 `from src.models.rife import get_model` 复用缓存，零重复加载
+    2. vpy 经 get_kernel 复用宿主已建模型与共享推理 worker，零重复加载
 
   帧倍增链（probe_vpy_chain 验证）:
-    RGBS → Trim(first=1) 时间平移 → StackHorizontal 帧对 [F_i | F_i+1]
-    → ModifyFrame(torch RIFE 求中点，写回左半) → Crop 半宽
-    → Interleave(原帧, 中点) → AssumeFPS x2 → 转回 YUV420P8/10
+    YUV → Trim(first=1) 时间平移 → StackHorizontal 帧对 [F_i | F_i+1]
+    → ModifyFrame(共享内核求中点，写回左半) → Crop 半宽
+    → Interleave(原帧, 中点) → AssumeFPS x2
+
+  YUV↔RGB 数学、精确相位 420 转换、单 worker 推理线程在共享内核
+  src/core/rife_kernel.py（Phase 2 抽出，实时与导出烘焙同源复用）。
 
 已实测约束（勿改回）:
   - vf 子选项 file= 且路径必须正斜杠（反斜杠破坏 mpv vf 列表解析）
+  - vf 子选项以 ':' 分隔会切掉盘符 → 必须用 mpv %n% 长度前缀转义，n 按 UTF-8 字节数
   - mpv 源 clip.fps=0/1、num_frames=0x7FFFFFF 哨兵 → fps 由宿主 container-fps
     写入 vpy 字面量；长度不修补（尾帧插值对自然落 EOF）
-  - 脚本 init 期禁止 get_frame(0)（mpv 报 frame-during-init 且回黑帧）→ 矩阵固定 709
-  - RGBS 三平面按 get_stride(p)//4 步长读写（帧内存有 stride 对齐）
+  - 脚本 init 期禁止 get_frame(0)（mpv 报 frame-during-init 且回黑帧）→ 矩阵
+    按帧 props 在回调内读取
   - pad 公式 max(128, 128/scale)：down 模式推理用 scale=1.0 → 三版本统一 pad 128
   - MIOpen 新分辨率配置首次编译可能耗时（磁盘缓存命中后毫秒级）→ prime 按当前
     视频分辨率预热；换视频后由 video_output_changed 驱动重新 prime
@@ -32,14 +36,14 @@ logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# vpy 模板：$MODEL/$FP16/$MODE/$SCALE/$FPS_NUM/$FPS_DEN/$REPO 由生成时注入。
-# 逻辑保持与 probe_vpy_chain.py 一致（该探针已在真机验证整链）。
+# vpy 模板：$MODEL/$FP16/$MODE/$SCALE/$FPS_NUM/$FPS_DEN/$REPO/$ERRLOG 由生成时注入。
+# 推理/色彩数学全部在 src/core/rife_kernel.py（与导出烘焙共享，勿在此重复实现）。
 _VPY_TEMPLATE = Template('''\
 # VentiPlayer RIFE 真插帧 —— 由 src/core/rife_service.py 生成，勿手改
 # 配置: model=$MODEL fp16=$FP16 mode=$MODE scale=$SCALE out_fps=$FPS_NUM/$FPS_DEN
 # YUV 域处理链（v2）: 帧平面直读 → GPU 上 YUV↔RGB（矩阵/范围按帧 props 动态）
-# → RIFE 推理 → 写回。不经 VS RGBS 浮点转换: PCIe 流量 ~80MB→~8MB/帧，
-# CPU zimg resize 全部消除（音画同步修复的关键，Phase 1.5）。
+# → RIFE 推理 → 写回。不经 VS RGBS 浮点转换: PCIe 流量 ~80MB→~8MB/帧。
+# 数学与推理线程在共享内核 src/core/rife_kernel.py（导出烘焙同源复用）。
 import sys
 _REPO = "$REPO"
 if _REPO not in sys.path:
@@ -47,10 +51,9 @@ if _REPO not in sys.path:
 import ctypes
 import numpy as np
 import torch
-import torch.nn.functional as F
 import vapoursynth as vs
 
-from src.models.rife import get_model
+from src.core.rife_kernel import MATRICES, get_kernel
 
 ERRLOG = r"$ERRLOG"
 MODEL = "$MODEL"
@@ -60,10 +63,7 @@ SCALE = $SCALE
 FPS_NUM = $FPS_NUM
 FPS_DEN = $FPS_DEN
 
-model = get_model(MODEL, fp16=bool(FP16))   # 宿主 prime 后直接命中缓存
-DT = torch.float16 if FP16 else torch.float32
-TS = torch.tensor([0.5], device="cuda", dtype=DT)
-
+kernel = get_kernel(MODEL, fp16=bool(FP16))   # 宿主 prime 后直接命中缓存
 core = vs.core
 src = video_in
 H, W = src.height, src.width
@@ -72,8 +72,6 @@ if FMT.color_family != vs.YUV or FMT.subsampling_w != 1 or FMT.subsampling_h != 
     raise RuntimeError("RIFE: unsupported format " + FMT.name)
 IS_NV12 = FMT.name == "NV12"
 B = FMT.bits_per_sample
-MAXV = float((1 << B) - 1)
-_DTYPE = torch.uint8 if B <= 8 else torch.uint16
 _CTYPE = ctypes.c_uint8 if B <= 8 else ctypes.c_uint16
 
 # 帧对: pair[i] = [F_i | F_i+1]（YUV 域水平拼接，420 子采样比例保持）。
@@ -81,72 +79,8 @@ _CTYPE = ctypes.c_uint8 if B <= 8 else ctypes.c_uint16
 shifted = src.std.Trim(first=1)
 pair = core.std.StackHorizontal(clips=[src, shifted])
 
-PAD = 128
-if MODE == "down":
-    DH = int(H * SCALE) // 2 * 2
-    DW = int(W * SCALE) // 2 * 2
-else:
-    DH, DW = H, W
-PH = (PAD - DH % PAD) % PAD
-PW = (PAD - DW % PAD) % PAD
-
-# ---- 单一专用推理线程 ----
-# torch/MIOpen handle 是 per-thread 的（实测新线程首推 ~700ms），VS 多工作线程
-# 轮流评估回调会持续触发初始化 → 卡顿。收拢单线程后 handle 终生复用。
-import threading as _th
-import queue as _q
-
-_infer_q = _q.Queue()
-
-def _infer_worker():
-    while True:
-        box = _infer_q.get()
-        if box is None:
-            return
-        try:
-            with torch.no_grad():
-                box["r"] = model.inference(box["a"], box["b"], TS, scale=1.0)
-        except BaseException as _e:
-            box["e"] = _e
-        box["ev"].set()
-
-_th.Thread(target=_infer_worker, daemon=True).start()
-
-def _submit_infer(a, b):
-    box = {"a": a, "b": b, "ev": _th.Event()}
-    _infer_q.put(box)
-    return box
-
-# 求值期预热 worker 的 MIOpen handle（kernel 已由宿主 prime 落盘缓存）
-_warm = torch.zeros(1, 3, DH + PH, DW + PW, device="cuda", dtype=DT)
-_box = _submit_infer(_warm, _warm)
-_box["ev"].wait()
-del _warm, _box
-
-# ---- YUV <-> RGB（BT.709/601/2020 + limited/full，逐帧 props 动态） ----
-_MTX = {1: (0.2126, 0.7152, 0.0722), 5: (0.299, 0.587, 0.114),
-        6: (0.299, 0.587, 0.114), 9: (0.2627, 0.6780, 0.0593)}
-
-def _ranges(full):
-    if full:
-        return 0.0, 1.0, 0.5, 1.0
-    if B <= 8:
-        return 16.0 / 255, 219.0 / 255, 128.0 / 255, 224.0 / 255
-    return 64.0 / MAXV, 876.0 / MAXV, 512.0 / MAXV, 896.0 / MAXV
-
-def _up2(t):
-    """420→444 精确相位 2x 双线性: 偶数位置=样本值, 奇数位置=邻均值。
-    与下采样取偶数位置互逆（整条 YUV→RGB→YUV 往返零误差，勿改用
-    F.interpolate——其 align_corners 两种语义都不是 420 相位）。"""
-    tp = F.pad(t[None, None], (0, 0, 0, 1), mode="replicate")[0, 0]
-    rows = torch.empty(t.shape[0] * 2, t.shape[1], device=t.device, dtype=t.dtype)
-    rows[0::2] = t
-    rows[1::2] = (tp[:-1] + tp[1:]) / 2
-    tp2 = F.pad(rows[None, None], (0, 1, 0, 0), mode="replicate")[0, 0]
-    cols = torch.empty(rows.shape[0], t.shape[1] * 2, device=t.device, dtype=t.dtype)
-    cols[:, 0::2] = rows
-    cols[:, 1::2] = (tp2[:, :-1] + tp2[:, 1:]) / 2
-    return cols
+# 求值期预热 worker 的 MIOpen handle（kernel 已由宿主 prime 落盘缓存时毫秒级）
+kernel.warm(H, W, SCALE if MODE == "down" else 1.0)
 
 def _plane(f, p, sh, sw, x0, x1):
     stride = f.get_stride(p)
@@ -165,11 +99,8 @@ def rife_cb(n, f):
     # VS/mpv 日志通道会截断深层 traceback，回调异常必须自行落盘才能定位根因
     try:
         props = f.props
-        mtx = _MTX.get(_prop_int(props, "_Matrix") or 1, _MTX[1])
+        mtx = MATRICES.get(_prop_int(props, "_Matrix") or 1, MATRICES[1])
         full = _prop_int(props, "_ColorRange") == 1
-        y_off, y_span, c_mid, c_span = _ranges(full)
-        kr, kg, kb = mtx
-        c_r, c_b = 2 * (1 - kb), 2 * (1 - kr)
 
         if IS_NV12:
             y_full = _plane(f, 0, H, 2 * W, 0, 2 * W)
@@ -185,54 +116,9 @@ def rife_cb(n, f):
             halves = [(y_full[:, :W], u_full[:, :W // 2], v_full[:, :W // 2]),
                       (y_full[:, W:], u_full[:, W // 2:], v_full[:, W // 2:])]
 
-        def _to_rgb(t3):
-            y, u, v = t3
-            y01 = (y.float() / MAXV - y_off) / y_span
-            u01 = (u.float() / MAXV - c_mid) / c_span
-            v01 = (v.float() / MAXV - c_mid) / c_span
-            u_up = _up2(u01)
-            v_up = _up2(v01)
-            r = y01 + c_r * v_up
-            b = y01 + c_b * u_up
-            g = (y01 - kr * r - kb * b) / kg
-            return torch.stack([r, g, b])[None]
-
-        rgb0 = _to_rgb(halves[0]).to(DT)
-        rgb1 = _to_rgb(halves[1]).to(DT)
-        if MODE == "down":
-            a = F.pad(F.interpolate(rgb0, size=(DH, DW), mode="bilinear",
-                                    align_corners=False), (0, PW, 0, PH))
-            b = F.pad(F.interpolate(rgb1, size=(DH, DW), mode="bilinear",
-                                    align_corners=False), (0, PW, 0, PH))
-            box = _submit_infer(a, b)
-            box["ev"].wait()
-            if "e" in box:
-                raise box["e"]
-            o = box["r"][:, :, :DH, :DW]
-            o = F.interpolate(o.float(), size=(H, W), mode="bilinear",
-                              align_corners=False)[0]
-        else:
-            a = F.pad(rgb0, (0, PW, 0, PH))
-            b = F.pad(rgb1, (0, PW, 0, PH))
-            box = _submit_infer(a, b)
-            box["ev"].wait()
-            if "e" in box:
-                raise box["e"]
-            o = box["r"][0, :, :H, :W].float()
-
-        o = o.clamp_(0.0, 1.0)
-        r, g, b = o[0], o[1], o[2]
-        y2 = kr * r + kg * g + kb * b
-        cb = (b - y2) / c_b
-        cr = (r - y2) / c_r
-        # 三平面拼成一次 D2H（每 .cpu() 一次同步 ~5ms，三次 14ms 是主要开销）
-        flat = torch.cat([((y2 * y_span + y_off) * MAXV).round().to(_DTYPE).reshape(-1),
-                          ((cb[::2, ::2] * c_span + c_mid) * MAXV).round().to(_DTYPE).reshape(-1),
-                          ((cr[::2, ::2] * c_span + c_mid) * MAXV).round().to(_DTYPE).reshape(-1)])
-        all_np = flat.cpu().numpy()
-        y_np = all_np[:H * W].reshape(H, W)
-        u_np = all_np[H * W:H * W + (H // 2) * (W // 2)].reshape(H // 2, W // 2)
-        v_np = all_np[H * W + (H // 2) * (W // 2):].reshape(H // 2, W // 2)
+        y_np, u_np, v_np = kernel.midpoint(
+            halves[0], halves[1], bits=B, full=full, mtx=mtx,
+            scale=SCALE if MODE == "down" else 1.0, out_h=H, out_w=W)
     except BaseException:
         try:
             import traceback as _tb
@@ -277,9 +163,6 @@ out.set_output()
 ''')
 
 
-
-
-
 def fps_to_fraction(src_fps: float) -> tuple[int, int]:
     """容器帧率 → 有理数（23.976 → 24000/1001，24.0 → 24/1）。"""
     frac = Fraction(float(src_fps)).limit_denominator(1001)
@@ -290,7 +173,8 @@ class RifeFrameGenService:
     """RIFE 真插帧编排：vpy 生成 + 后台预热（模型构建/MIOpen 编译）。
 
     线程模型: prime() 阻塞式（调用方放后台线程）；write_vpy() 纯文本写入。
-    模型实例缓存在 src.models.rife 模块级（vpy 与宿主共享 interpreter，直接复用）。
+    模型实例与推理 worker 缓存在 src.core.rife_kernel 进程级（vpy 与宿主共享
+    interpreter，直接复用）。
     """
 
     def __init__(self, config_dir: Path | None = None):

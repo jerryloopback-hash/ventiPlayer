@@ -106,6 +106,7 @@ class ExportSettings:
     render_props: dict = field(default_factory=dict)     # mpv render property 字典
     upscale_factor: int = 1                              # 有效超分倍率 1/2/4
     video_scheme_label: str = "原画"                     # 中文画面方案摘要
+    framegen: dict = field(default_factory=dict)   # RIFE 插帧 {enabled,backend,model,scale}，空=不插帧
 
     # 源信息（用于 ExportResult 里报告真实参数与截止频率估算）
     src_width: Optional[int] = None
@@ -132,6 +133,7 @@ class ExportSettings:
             render_props=dict(export_state.get("render_props", {})),
             upscale_factor=int(export_state.get("upscale_factor", 1) or 1),
             video_scheme_label=export_state.get("scheme_label", "原画"),
+            framegen=dict(export_state.get("framegen") or {}),
             src_width=getattr(stream, "video_width", None),
             src_height=getattr(stream, "video_height", None),
             src_fps=getattr(stream, "video_fps", None),
@@ -171,6 +173,8 @@ class ExportResult:
     audio_scheme_label: str = ""
     video_scheme_label: str = ""
     gpu_baked: bool = False  # True=离屏 GPU 真实烘焙；False=退化为 PyAV 近似
+    gpu_degraded: bool = False  # True=本次导出确实依赖了 GPU 烘焙但退化了（UI 弹窗提示用）
+    framegen_baked: bool = False  # True=RIFE 真插帧已烘焙进文件（帧率翻倍）
 
     @property
     def video_info_label(self) -> str:

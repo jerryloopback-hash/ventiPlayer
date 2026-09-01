@@ -23,10 +23,13 @@ class VideoEncoderMixin:
     """共享的 PyAV 视频编码器工具（GPU/PyAV 两条烘焙路径都用）。"""
 
     def _open_video_encoder(self, path: str, width: int, height: int,
-                            fps: float, codec: str):
+                            fps: float, codec: str,
+                            pix_fmt: str = "yuv420p",
+                            options: Optional[dict] = None):
         """打开一个仅含视频流的 PyAV 输出，返回 (container, stream, time_base_fps)。
 
-        编码 H.264(libx264)，像素格式 yuv420p（兼容性最佳，宽高需为偶数）。"""
+        默认编码 H.264(libx264) yuv420p（兼容性最佳，宽高需为偶数）；
+        RIFE 纯烘焙直出会传 pix_fmt=yuv420p10le 保留源位深、自定义 options。"""
         import av
         fps = fps if fps and fps > 0 else 25.0
         rate = Fraction(fps).limit_denominator(100000)
@@ -38,14 +41,14 @@ class VideoEncoderMixin:
         stream = container.add_stream(codec or "libx264", rate=rate)
         stream.width = width
         stream.height = height
-        stream.pix_fmt = "yuv420p"
+        stream.pix_fmt = pix_fmt
         try:
             stream.codec_context.time_base = Fraction(1, 1) / rate
         except Exception:
             pass
         # 合理默认：crf 18 接近视觉无损，preset medium 平衡速度/体积
         try:
-            stream.options = {"crf": "18", "preset": "medium"}
+            stream.options = options or {"crf": "18", "preset": "medium"}
         except Exception:
             pass
         return container, stream, rate

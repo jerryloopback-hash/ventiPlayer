@@ -1013,8 +1013,8 @@ class VideoEnhancePanel(QWidget):
     def _build_scheme_label(self) -> str:
         """生成中文画面方案摘要，如
         '超分Anime4K x4 + 锐化 + 去色带 + 降噪双边Median + HDR'。未启用任何画面增强时返回 '原画'。
-        注意：插帧(display-resample 伪插帧)是显示期属性、无法烘焙进文件，故方案标签里
-        显式标注「插帧不烘焙」。
+        注意：RIFE 真插帧可烘焙进导出文件（帧率x2），方案标签里标注；
+        display-resample 伪插帧/小黄鸭是显示期特性、无法烘焙，故显式标注「插帧不烘焙」。
         """
         parts: list[str] = []
         if self._enable_upscale.isChecked():
@@ -1036,7 +1036,13 @@ class VideoEnhancePanel(QWidget):
             parts.append("HDR")
         label = " + ".join(parts) if parts else "原画"
         if self._enable_fg.isChecked():
-            label += "（插帧不烘焙）"
+            backend = self._BACKEND_KEY.get(self._fg_backend.currentIndex(),
+                                            "display-resample")
+            if backend == "rife-torch":
+                label += (f" + RIFE插帧({self._rife_model.currentText()} "
+                          f"{self._rife_scale.currentText()}，烘焙帧率x2)")
+            else:
+                label += "（插帧不烘焙）"
         return label
 
     def get_export_state(self) -> dict:
@@ -1047,15 +1053,29 @@ class VideoEnhancePanel(QWidget):
             render_props:   dict       要写给 mpv 的 render property（亮度/对比度/饱和度/
                                        gamma/deband*/tone-mapping/hdr-compute-peak）
             upscale_factor: int        有效超分倍率(1/2/4)，未启用超分为 1
-            scheme_label:   str        中文画面方案摘要（含「插帧不烘焙」标注）
+            scheme_label:   str        中文画面方案摘要（含插帧烘焙/不烘焙标注）
+            framegen:       dict       RIFE 插帧 {enabled,backend,model,scale}；
+                                       仅 rife-torch 且依赖可用时非空，其余后端为空
         """
         upscale_factor = (
             self._get_current_upscale_factor()
             if self._enable_upscale.isChecked() else 1
         )
+        fg_backend = self._BACKEND_KEY.get(self._fg_backend.currentIndex(),
+                                           "display-resample")
+        framegen: dict = {}
+        if (self._enable_fg.isChecked() and fg_backend == "rife-torch"
+                and self._fg_caps.get("rife_torch", {}).get("available", False)):
+            framegen = {
+                "enabled": True,
+                "backend": "rife-torch",
+                "model": self._rife_model.currentData() or "v4_25_lite",
+                "scale": float(self._rife_scale.currentData() or 0.75),
+            }
         return {
             "shaders": self._build_shader_list(),
             "render_props": self._build_render_properties(),
             "upscale_factor": upscale_factor,
             "scheme_label": self._build_scheme_label(),
+            "framegen": framegen,
         }

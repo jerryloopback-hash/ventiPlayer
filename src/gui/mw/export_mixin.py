@@ -18,7 +18,8 @@ class ExportMixin:
         """设置面板「导出当前视频为 MP4」：门控→选保存路径→后台烘焙导出。
 
         导出文件会真实套用当前面板上的音频(Apollo/FlashSR)与画面(超分/锐化/去色带/
-        降噪/HDR 等)增强；插帧不烘焙(伪插帧是显示期特性，小黄鸭是外部叠加)。
+        降噪/HDR 等)增强；RIFE 真插帧也会烘焙进文件（帧率x2）；
+        伪插帧(display-resample)是显示期特性、小黄鸭是外部叠加，两者不烘焙。
         """
         stream = self._current_stream
         if stream is None or stream.is_live:
@@ -100,7 +101,9 @@ class ExportMixin:
             f"音频修复方案：{result.audio_scheme_label}\n"
             f"画面增强方案：{result.video_scheme_label}"
         )
-        if not result.gpu_baked:
+        if result.framegen_baked:
+            body += "\n\nRIFE 真插帧已烘焙进文件（帧率翻倍）。"
+        if result.gpu_degraded:
             body += (
                 "\n\n注意：当前环境无法创建离屏 GPU 渲染上下文，已退化为 PyAV 近似烘焙；"
                 "GLSL 着色器（Anime4K/FSR 超分、CAS 锐化等）未能真实烘焙到文件。"
